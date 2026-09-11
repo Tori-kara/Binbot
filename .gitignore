@@ -1,1 +1,76 @@
-/target
+# =====================================
+# Rust / Cargo
+# =====================================
+/target/
+**/*.rs.bk
+*.pdb
+*.profdata
+*.profraw
+
+# =====================================
+# Environment Variables & Secrets
+# =====================================
+.env
+.env.*
+!.env.example
+!.env.template
+
+# =====================================
+# Database & Local Storage
+# =====================================
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# =====================================
+# Logs & Temp Files
+# =====================================
+*.log
+logs/
+tmp/
+temp/
+
+# =====================================
+# Operating System Files
+# =====================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+
+# Linux
+*~
+
+# =====================================
+# IDEs & Editors
+# =====================================
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# JetBrains (RustRover / CLion / IntelliJ)
+.idea/
+*.iml
+cmake-build-*/
+
+# Vim / Emacs
+*.swp
+*.swo
+*~
+.#*
+\#*#
