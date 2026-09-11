@@ -198,6 +198,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -3067,8 +3068,12 @@ checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
 dependencies = [
  "futures-util",
  "log",
+ "rustls 0.23.44",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls 0.26.5",
  "tungstenite 0.30.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -3304,6 +3309,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.10.2",
+ "rustls 0.23.44",
+ "rustls-pki-types",
  "sha1 0.11.0",
  "thiserror 2.0.20",
 ]
