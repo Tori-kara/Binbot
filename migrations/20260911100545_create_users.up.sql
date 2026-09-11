@@ -1,0 +1,8 @@
+-- Add up migration script here
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    discord_id VARCHAR(32) NOT NULL UNIQUE,
+    username VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
