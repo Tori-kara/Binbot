@@ -1,10 +1,12 @@
 mod binance;
 mod config;
 mod error;
+mod market;
 mod storage;
 
-use binance::{ticker_stream, BinanceEvent, BinanceWebSocketClient, BinanceWsConfig};
+use binance::{ticker_stream, BinanceWebSocketClient, BinanceWsConfig};
 use config::Config;
+use market::{MarketProcessor, MarketState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_client = BinanceWebSocketClient::connect(ws_config)?;
 
     // Listen to incoming market events
-    let mut event_rx = ws_client.subscribe_events();
+    let event_rx = ws_client.subscribe_events();
 
     // Subscribe to real-time ticker updates for major cryptocurrencies
     let test_streams = vec![
@@ -53,57 +55,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ws_client.subscribe(test_streams).await?;
     tracing::info!("✓ Binance WebSocket connected (streams: BTC, ETH, SOL)");
 
-    tracing::info!("All connections established. Binbot is running! (Press Ctrl+C to stop)");
+    // 4. Market Data Engine
+    let market_state = MarketState::new();
+    let (update_tx, _update_rx) = tokio::sync::broadcast::channel(100);
+    let processor = MarketProcessor::new(market_state.clone(), update_tx);
+    tracing::info!("✓ Market Data Engine initialized");
 
-    // Background event consumer loop (logged at debug level to keep terminal clean)
+    // Spawn background market data processor
     tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            match event {
-                BinanceEvent::Ticker(ticker) => {
-                    tracing::debug!(
-                        symbol = %ticker.symbol,
-                        price = %ticker.current_close,
-                        change_pct = %ticker.price_change_percent,
-                        high = %ticker.high_price,
-                        low = %ticker.low_price,
-                        volume = %ticker.total_base_volume,
-                        "Market Ticker"
-                    );
-                }
-                BinanceEvent::MiniTicker(mini) => {
-                    tracing::debug!(
-                        symbol = %mini.symbol,
-                        price = %mini.current_close,
-                        "Mini Ticker"
-                    );
-                }
-                BinanceEvent::Trade(trade) => {
-                    tracing::debug!(
-                        symbol = %trade.symbol,
-                        price = %trade.price,
-                        quantity = %trade.quantity,
-                        "Trade"
-                    );
-                }
-                BinanceEvent::AggTrade(agg) => {
-                    tracing::debug!(
-                        symbol = %agg.symbol,
-                        price = %agg.price,
-                        quantity = %agg.quantity,
-                        "Agg Trade"
-                    );
-                }
-                BinanceEvent::Kline(kline) => {
-                    tracing::debug!(
-                        symbol = %kline.symbol,
-                        close = %kline.kline.close_price,
-                        interval = %kline.kline.interval,
-                        is_closed = %kline.kline.is_closed,
-                        "Kline"
-                    );
-                }
-            }
-        }
+        processor.run(event_rx).await;
     });
 
     // Keep running and handle graceful shutdown on Ctrl+C
