@@ -123,7 +123,7 @@ impl WebSocketWorker {
         let mut reconnect_delay = self.config.initial_reconnect_delay;
 
         loop {
-            tracing::info!(
+            tracing::debug!(
                 endpoint = %self.config.base_url,
                 active_streams = self.active_subscriptions.len(),
                 "Connecting to Binance WebSocket..."
@@ -139,7 +139,7 @@ impl WebSocketWorker {
 
             match connect_async(ws_url.as_str()).await {
                 Ok((ws_stream, response)) => {
-                    tracing::info!(
+                    tracing::debug!(
                         status = %response.status(),
                         "Successfully connected to Binance WebSocket"
                     );
@@ -154,7 +154,7 @@ impl WebSocketWorker {
                         let streams: Vec<String> = self.active_subscriptions.iter().cloned().collect();
                         let sub_req = SubscriptionRequest::subscribe(streams, self.next_id());
                         if let Ok(payload) = serde_json::to_string(&sub_req) {
-                            tracing::info!(
+                            tracing::debug!(
                                 count = self.active_subscriptions.len(),
                                 "Re-subscribing active streams to Binance"
                             );
@@ -182,7 +182,7 @@ impl WebSocketWorker {
                                         if !new_streams.is_empty() {
                                             let sub_req = SubscriptionRequest::subscribe(new_streams, self.next_id());
                                             if let Ok(payload) = serde_json::to_string(&sub_req) {
-                                                tracing::info!(payload = %payload, "Sending SUBSCRIBE payload to Binance");
+                                                tracing::debug!(payload = %payload, "Sending SUBSCRIBE payload to Binance");
                                                 if let Err(e) = ws_writer.send(Message::Text(payload.into())).await {
                                                     tracing::warn!(error = %e, "Failed to send SUBSCRIBE message");
                                                     break 'connection;
@@ -215,7 +215,7 @@ impl WebSocketWorker {
                                         break 'connection;
                                     }
                                     None => {
-                                        tracing::info!("Client handle dropped; shutting down worker");
+                                        tracing::debug!("Client handle dropped; shutting down worker");
                                         should_reconnect = false;
                                         break 'connection;
                                     }
@@ -269,7 +269,7 @@ impl WebSocketWorker {
             }
 
             // Exponential backoff before reconnecting
-            tracing::info!(delay_secs = reconnect_delay.as_secs(), "Waiting before reconnecting...");
+            tracing::debug!(delay_secs = reconnect_delay.as_secs(), "Waiting before reconnecting...");
             tokio::time::sleep(reconnect_delay).await;
             reconnect_delay = (reconnect_delay * 2).min(self.config.max_reconnect_delay);
         }

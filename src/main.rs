@@ -18,35 +18,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_target(false)
         .init();
 
-    tracing::info!("Binbot starting...");
+    tracing::info!("Initializing Binbot...");
 
     let config = Config::from_env()?;
-    tracing::info!(
-        raw_endpoint = %config.binance_raw,
-        combined_endpoint = %config.binance_combined,
-        "Configuration loaded"
-    );
+    tracing::info!("✓ Configuration loaded");
 
-    // 1. Test Database connection
-    tracing::info!("Connecting to PostgreSQL database...");
+    // 1. PostgreSQL database connection & migrations
     let db_pool = storage::db::init_db(&config.database_url).await?;
     sqlx::query("SELECT 1").execute(&db_pool).await?;
-    tracing::info!("Database connection verified successfully (SELECT 1)");
-
-    // Run pending migrations
     storage::db::run_migrations(&db_pool).await?;
-    tracing::info!("Database migrations executed/verified successfully");
+    tracing::info!("✓ PostgreSQL connected & migrations up to date");
 
-    // 2. Test Redis connection
-    tracing::info!("Connecting to Redis...");
+    // 2. Redis connection
     let mut redis_conn = storage::redis::init_redis(&config.redis_url).await?;
-    let pong: String = redis::cmd("PING").query_async(&mut redis_conn).await?;
-    tracing::info!(response = %pong, "Redis connection verified successfully");
+    let _pong: String = redis::cmd("PING").query_async(&mut redis_conn).await?;
+    tracing::info!("✓ Redis connected & verified");
 
-    // 3. Initialize Binance WebSocket client with configured raw stream endpoint (/ws)
-    tracing::info!("Connecting to Binance WebSocket...");
+    // 3. Binance WebSocket connection
     let ws_config = BinanceWsConfig::new(&config.binance_raw);
     let ws_client = BinanceWebSocketClient::connect(ws_config)?;
 
@@ -59,54 +50,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ticker_stream("ETHUSDT"),
         ticker_stream("SOLUSDT"),
     ];
-    tracing::info!(streams = ?test_streams, "Subscribing to Binance streams");
     ws_client.subscribe(test_streams).await?;
+    tracing::info!("✓ Binance WebSocket connected (streams: BTC, ETH, SOL)");
 
-    // Spawn an event consumer loop that logs real-time price updates
+    tracing::info!("All connections established. Binbot is running! (Press Ctrl+C to stop)");
+
+    // Background event consumer loop (logged at debug level to keep terminal clean)
     tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
             match event {
                 BinanceEvent::Ticker(ticker) => {
-                    tracing::info!(
+                    tracing::debug!(
                         symbol = %ticker.symbol,
                         price = %ticker.current_close,
                         change_pct = %ticker.price_change_percent,
                         high = %ticker.high_price,
                         low = %ticker.low_price,
                         volume = %ticker.total_base_volume,
-                        "Market Ticker Update"
+                        "Market Ticker"
                     );
                 }
                 BinanceEvent::MiniTicker(mini) => {
-                    tracing::info!(
+                    tracing::debug!(
                         symbol = %mini.symbol,
                         price = %mini.current_close,
-                        "Mini Ticker Update"
+                        "Mini Ticker"
                     );
                 }
                 BinanceEvent::Trade(trade) => {
-                    tracing::info!(
+                    tracing::debug!(
                         symbol = %trade.symbol,
                         price = %trade.price,
                         quantity = %trade.quantity,
-                        "Trade Execution"
+                        "Trade"
                     );
                 }
                 BinanceEvent::AggTrade(agg) => {
-                    tracing::info!(
+                    tracing::debug!(
                         symbol = %agg.symbol,
                         price = %agg.price,
                         quantity = %agg.quantity,
-                        "Aggregate Trade"
+                        "Agg Trade"
                     );
                 }
                 BinanceEvent::Kline(kline) => {
-                    tracing::info!(
+                    tracing::debug!(
                         symbol = %kline.symbol,
                         close = %kline.kline.close_price,
                         interval = %kline.kline.interval,
                         is_closed = %kline.kline.is_closed,
-                        "Kline/Candle Update"
+                        "Kline"
                     );
                 }
             }
@@ -117,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     tracing::info!("Shutdown signal received, shutting down Binbot...");
     ws_client.shutdown().await?;
+    tracing::info!("Binbot shutdown complete.");
 
     Ok(())
 }
