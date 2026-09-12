@@ -40,6 +40,10 @@ impl MarketProcessor {
                 // Update in-memory state and retrieve previous price
                 let previous_price = self.state.update(market_data.clone()).await;
 
+                if previous_price.is_none() {
+                    tracing::info!("✓ Now tracking: {} @ ${}", symbol, market_data.price);
+                }
+
                 trace!(
                     symbol = %symbol,
                     price = %market_data.price,
@@ -98,8 +102,17 @@ impl MarketProcessor {
     /// Starts an asynchronous worker loop consuming events from a Binance event receiver
     pub async fn run(self, mut event_rx: broadcast::Receiver<BinanceEvent>) {
         debug!("MarketProcessor worker started");
-        while let Ok(event) = event_rx.recv().await {
-            self.process_event(event).await;
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => self.process_event(event).await,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::trace!("MarketProcessor lagged by {} events", skipped);
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    debug!("MarketProcessor event stream closed");
+                    break;
+                }
+            }
         }
         debug!("MarketProcessor worker terminated");
     }

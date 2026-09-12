@@ -276,26 +276,46 @@ impl WebSocketWorker {
     }
 
     fn handle_incoming_text(&self, text: &str) {
-        // 1. Try combined stream payload: {"stream": "...", "data": {...}}
+        // 1. Try combined stream payload: {"stream": "...", "data": {...} or [...]}
         if let Ok(combined) = serde_json::from_str::<CombinedStreamPayload<serde_json::Value>>(text) {
-            if let Ok(event) = serde_json::from_value::<BinanceEvent>(combined.data) {
+            if let Ok(event) = serde_json::from_value::<BinanceEvent>(combined.data.clone()) {
                 let _ = self.event_tx.send(event);
+                return;
+            }
+            if let Ok(events) = serde_json::from_value::<Vec<BinanceEvent>>(combined.data) {
+                for event in events {
+                    let _ = self.event_tx.send(event);
+                }
                 return;
             }
         }
 
-        // 2. Try direct event payload: {"e": "...", ...}
+        // 2. Try direct single event payload: {"e": "...", ...}
         if let Ok(event) = serde_json::from_str::<BinanceEvent>(text) {
             let _ = self.event_tx.send(event);
             return;
         }
 
-        // 3. Try subscription response: {"result": null, "id": 1}
+        // 3. Try direct array of events: [{"e": "...", ...}, ...] (e.g. !ticker@arr)
+        if let Ok(raw_array) = serde_json::from_str::<Vec<serde_json::Value>>(text) {
+            let mut count = 0;
+            for val in raw_array {
+                if let Ok(event) = serde_json::from_value::<BinanceEvent>(val) {
+                    let _ = self.event_tx.send(event);
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                return;
+            }
+        }
+
+        // 4. Try subscription response: {"result": null, "id": 1}
         if let Ok(sub_resp) = serde_json::from_str::<SubscriptionResponse>(text) {
             if let Some(err) = sub_resp.error {
                 tracing::error!(id = sub_resp.id, code = err.code, msg = %err.msg, "Binance subscription error");
             } else {
-                tracing::debug!(id = sub_resp.id, result = ?sub_resp.result, "Binance subscription ack received");
+                tracing::info!(id = sub_resp.id, result = ?sub_resp.result, "Binance subscription confirmed");
             }
             return;
         }

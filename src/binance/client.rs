@@ -28,7 +28,7 @@ impl Default for BinanceWsConfig {
             base_url: DEFAULT_BINANCE_WS_COMBINED_URL.to_string(),
             initial_reconnect_delay: Duration::from_secs(1),
             max_reconnect_delay: Duration::from_secs(60),
-            event_buffer_size: 2048,
+            event_buffer_size: 16384,
         }
     }
 }
@@ -36,6 +36,16 @@ impl Default for BinanceWsConfig {
 /// Helper methods to generate standardized Binance stream names (case-insensitive conversion to lowercase)
 pub fn ticker_stream(symbol: &str) -> String {
     format!("{}@ticker", symbol.to_ascii_lowercase())
+}
+
+/// Stream name for 24-hour rolling ticker updates for all symbols on the market
+pub fn all_market_tickers_stream() -> String {
+    "!ticker@arr".to_string()
+}
+
+/// Stream name for mini-ticker updates for all symbols on the market
+pub fn all_market_mini_tickers_stream() -> String {
+    "!miniTicker@arr".to_string()
 }
 
 pub fn mini_ticker_stream(symbol: &str) -> String {
