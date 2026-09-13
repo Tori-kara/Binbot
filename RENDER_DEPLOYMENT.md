@@ -89,3 +89,29 @@ Binbot runs an internal lightweight Axum web server on `$PORT`:
 - `GET /healthz` → `200 OK` (Returns JSON `{"status": "ok", "app": "binbot", "discord_bot_url": "..."}`)
 
 This ensures Render's health monitor marks the deployment green immediately upon launch while providing a public-facing portal for guild installation.
+
+---
+
+## ⏰ Render Free Tier Sleep Behavior & Automated Wake-up
+
+Render's Free Tier automatically puts web services to sleep after 15 minutes of inbound HTTP inactivity. Binbot includes three complementary tools to handle and automate service wake-up:
+
+### 1. Discord Slash Command (`/wakeup`)
+- Type `/wakeup` in Discord to inspect and confirm live status across the web server, WebSocket feed, PostgreSQL, and Redis.
+
+### 2. Automated Check-and-Wake Command Runner (`scripts/wakeup.sh` & `scripts/wakeup.ps1`)
+Use the automated check-and-wake script to wrap your CLI workflows or deployment commands:
+- **Instant Check**: Performs a 2-second `/healthz` check. If active, runs your command immediately.
+- **Auto-Wake**: If sleeping, pings Render to boot the container, polls until ready, and then executes your command seamlessly!
+
+```bash
+# PowerShell (Windows)
+.\scripts\wakeup.ps1 -BackendUrl "https://binbot.onrender.com" -Command "cargo test"
+
+# Bash (Linux / macOS)
+./scripts/wakeup.sh https://binbot.onrender.com cargo test
+```
+
+### 3. Zero-Downtime 24/7 Keep-Alive Strategy
+To prevent Render from ever spinning down, set up a free HTTP pinger (such as [UptimeRobot](https://uptimerobot.com)) to ping `https://<your-app>.onrender.com/healthz` every 14 minutes.
+
