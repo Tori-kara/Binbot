@@ -52,9 +52,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("✓ PostgreSQL connected & migrations up to date");
 
     // 2. Redis connection
-    let mut redis_conn = storage::redis::init_redis(&config.redis_url).await?;
-    let _pong: String = redis::cmd("PING").query_async(&mut redis_conn).await?;
+    let mut redis_conn = match storage::redis::init_redis(&config.redis_url).await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::error!("Redis initialization failed: {err}");
+            return Err(format!("Redis connection failed: {err}").into());
+        }
+    };
+    let _pong: String = match tokio::time::timeout(
+        Duration::from_secs(5),
+        redis::cmd("PING").query_async(&mut redis_conn),
+    )
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(err)) => {
+            tracing::error!("Redis PING failed: {err}");
+            return Err(format!("Redis PING failed: {err}").into());
+        }
+        Err(_) => {
+            tracing::error!("Redis PING timed out after 5s");
+            return Err("Redis PING timed out after 5s".into());
+        }
+    };
     tracing::info!("✓ Redis connected & verified");
+
 
     // 3. Binance WebSocket connection
     let ws_config = BinanceWsConfig::new(&config.binance_raw);

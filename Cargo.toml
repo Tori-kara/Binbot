@@ -10,7 +10,7 @@ config = "0.15.25"
 dotenvy = "0.15.7"
 futures-util = "0.3.34"
 poise = "0.7.0"
-redis = { version = "1.7.0", features = ["tokio-comp", "tokio-native-tls-comp"] }
+redis = { version = "1.7.0", features = ["tokio-comp", "tokio-rustls-comp"] }
 rust_decimal = "1.43.0"
 rust_decimal_macros = "1.40.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
