@@ -181,25 +181,3 @@ pub fn create_not_found_embed(query: &str, tracked_symbols: &[String]) -> Create
         .footer(CreateEmbedFooter::new("BinBot • Symbol Lookup"))
         .timestamp(Timestamp::from_unix_timestamp(Utc::now().timestamp()).unwrap_or_else(|_| Timestamp::now()))
 }
-
-pub fn create_wakeup_embed(tracked_symbols_count: usize, fiat_count: usize) -> CreateEmbed {
-    let description = format!(
-        "**Render Web Service status:** 🟢 Active & Fully Operational\n\n\
-        The backend engine is awake and actively processing real-time Binance WebSocket market feeds and Discord slash commands.\n\n\
-        **System Components:**\n\
-        • **Axum Web Server:** 🟢 200 OK (`/healthz` active)\n\
-        • **Binance Stream:** 🟢 Subscribed (`{} market symbols` live)\n\
-        • **Fiat Engine:** 🟢 Active (`{} currencies` cached)\n\
-        • **PostgreSQL & Redis:** 🟢 Operational",
-        tracked_symbols_count, fiat_count
-    );
-
-    let ts = Timestamp::from_unix_timestamp(Utc::now().timestamp()).unwrap_or_else(|_| Timestamp::now());
-
-    CreateEmbed::new()
-        .title("⚡ Binbot & Render Service — System Status")
-        .description(description)
-        .color(0x2ECC71)
-        .footer(CreateEmbedFooter::new("Binbot Engine • Render Deployment Active"))
-        .timestamp(ts)
-}

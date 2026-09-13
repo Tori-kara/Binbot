@@ -92,26 +92,42 @@ This ensures Render's health monitor marks the deployment green immediately upon
 
 ---
 
-## ⏰ Render Free Tier Sleep Behavior & Automated Wake-up
+## ⏰ 24/7 Zero-Downtime via UptimeRobot Keep-Alive
 
-Render's Free Tier automatically puts web services to sleep after 15 minutes of inbound HTTP inactivity. Binbot includes three complementary tools to handle and automate service wake-up:
+Render's Free Tier automatically spins down web services after **15 minutes of inbound HTTP inactivity**. Because Binbot runs as a single unified service (the Axum HTTP server, Discord Serenity bot gateway, and Binance WebSocket feeds all share the same container lifecycle), keeping the web service awake keeps the entire bot and stream engine active 24/7.
 
-### 1. Discord Slash Command (`/wakeup`)
-- Type `/wakeup` in Discord to inspect and confirm live status across the web server, WebSocket feed, PostgreSQL, and Redis.
+Setting up a free external ping monitor via [UptimeRobot](https://uptimerobot.com) prevents cold starts, eliminates gateway disconnects, and guarantees instant Discord command responses with zero cost.
 
-### 2. Automated Check-and-Wake Command Runner (`scripts/wakeup.sh` & `scripts/wakeup.ps1`)
-Use the automated check-and-wake script to wrap your CLI workflows or deployment commands:
-- **Instant Check**: Performs a 2-second `/healthz` check. If active, runs your command immediately.
-- **Auto-Wake**: If sleeping, pings Render to boot the container, polls until ready, and then executes your command seamlessly!
+### Step-by-Step UptimeRobot Setup
 
-```bash
-# PowerShell (Windows)
-.\scripts\wakeup.ps1 -BackendUrl "https://binbot.onrender.com" -Command "cargo test"
+1. **Create an Account**: Sign up for free at [uptimerobot.com](https://uptimerobot.com).
+2. **Add a New Monitor**:
+   - In the UptimeRobot dashboard, click **+ Add New Monitor**.
+3. **Configure Monitor Settings**:
+   - **Monitor Type**: Select `HTTP(s)`
+   - **Friendly Name**: `Binbot Render Service` (or your choice)
+   - **URL (or IP)**: `https://<your-service-name>.onrender.com/healthz`
+   - **Monitoring Interval**: Select `5 minutes` (recommended) or `10 minutes` (must be less than Render's 15-minute timeout)
+   - **Monitor Timeout**: `30 seconds`
+4. **Keyword Monitoring (Optional)**:
+   - If using Keyword monitor type, set Keyword to `"status":"ok"` and alert if Keyword is **Not Present**.
+5. **Alert Notifications**:
+   - Select your notification contacts (Email, Discord Webhook, Slack, SMS) to be alerted immediately if your Render service experiences unexpected downtime.
+6. **Save**: Click **Create Monitor**.
 
-# Bash (Linux / macOS)
-./scripts/wakeup.sh https://binbot.onrender.com cargo test
+### How It Works
+
+```text
+[UptimeRobot Cloud] ──(GET /healthz every 5m)──> [Render Web Service (Port 10000)]
+                                                            │
+                                         ┌──────────────────┴──────────────────┐
+                                         ▼                                     ▼
+                             [Discord Gateway Bot]                 [Binance WebSocket Stream]
+                             (Active & Responsive)                 (Real-Time Market Tickers)
 ```
 
-### 3. Zero-Downtime 24/7 Keep-Alive Strategy
-To prevent Render from ever spinning down, set up a free HTTP pinger (such as [UptimeRobot](https://uptimerobot.com)) to ping `https://<your-app>.onrender.com/healthz` every 14 minutes.
+- Every 5 minutes, UptimeRobot sends a lightweight `GET` request to `https://<your-app>.onrender.com/healthz`.
+- Binbot's internal Axum web server instantly replies with `200 OK` and a minimal JSON payload (`{"status": "ok", "app": "binbot", ...}`).
+- Render resets its 15-minute idle countdown upon receiving the request, keeping the container running continuously 24/7.
+
 
