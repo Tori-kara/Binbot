@@ -1,0 +1,22 @@
+# Build and version control artifacts
+target
+.git
+.gitignore
+.github
+
+# Environment and sensitive secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Documentation and editor files
+*.md
+.vscode
+.idea
+.gemini
+
+# Logs and scratch files
+*.log
+scratch
+examples

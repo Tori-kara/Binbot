@@ -5,6 +5,7 @@ mod discord;
 mod error;
 mod market;
 mod storage;
+mod web;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,8 +33,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Initializing Binbot...");
 
-    let config = Config::from_env()?;
-    tracing::info!("✓ Configuration loaded");
+    let config = match Config::from_env() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::error!("Config error: {err}");
+            return Err(err);
+        }
+    };
+    tracing::info!("✓ Config loaded ({})", config.summary());
+
+    // 0. Render Web Service Health Check Server
+    web::start_health_server(config.port).await;
 
     // 1. PostgreSQL database connection & migrations
     let db_pool = storage::db::init_db(&config.database_url).await?;

@@ -28,3 +28,11 @@ url = "2.5.8"
 
 [profile.test]
 debug = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+panic = "abort"
+
