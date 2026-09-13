@@ -1,14 +1,17 @@
 use std::sync::Arc;
 use serenity::all::{GatewayIntents, GuildId};
+use tokio::sync::mpsc;
 
+use crate::alerts::{AlertNotification, AlertStore};
 use crate::currency::CurrencyService;
 use crate::market::MarketState;
 
 /// Application data shared across Poise commands
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Data {
     pub market_state: MarketState,
     pub currency_service: Arc<CurrencyService>,
+    pub alert_store: Arc<AlertStore>,
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -19,12 +22,18 @@ pub async fn run_bot(
     token: String,
     market_state: MarketState,
     currency_service: Arc<CurrencyService>,
+    alert_store: Arc<AlertStore>,
+    notification_rx: mpsc::Receiver<AlertNotification>,
     guild_id: Option<u64>,
 ) -> Result<(), Error> {
+    let bot_alert_store = alert_store.clone();
+
     let options = poise::FrameworkOptions {
         commands: vec![
             crate::discord::commands::price(),
             crate::discord::commands::currencies(),
+            crate::discord::commands::watch(),
+            crate::discord::commands::alerts(),
         ],
         on_error: |error| {
             Box::pin(async move {
@@ -81,6 +90,7 @@ pub async fn run_bot(
                 Ok(Data {
                     market_state,
                     currency_service,
+                    alert_store: bot_alert_store,
                 })
             })
         })
@@ -90,6 +100,13 @@ pub async fn run_bot(
     let mut client = serenity::all::ClientBuilder::new(token, intents)
         .framework(framework)
         .await?;
+
+    // Spawn rate-limited Discord alert dispatcher
+    let http = client.http.clone();
+    let dispatcher = crate::discord::notifier::AlertDispatcher::new(http);
+    tokio::spawn(async move {
+        dispatcher.run(notification_rx).await;
+    });
 
     tracing::info!("✓ Discord Gateway client connecting...");
     client.start().await?;
