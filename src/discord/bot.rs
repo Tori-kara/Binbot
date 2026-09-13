@@ -25,7 +25,6 @@ pub async fn run_bot(
         commands: vec![
             crate::discord::commands::price(),
             crate::discord::commands::currencies(),
-            crate::discord::commands::wakeup(),
         ],
         on_error: |error| {
             Box::pin(async move {
