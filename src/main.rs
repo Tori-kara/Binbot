@@ -42,8 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tracing::info!("✓ Config loaded ({})", config.summary());
 
-    // 0. Render Web Service Health Check Server
-    web::start_health_server(config.port).await;
+    // 0. Render Web Service Health Check & Bot Invitation Server
+    web::start_health_server(config.port, config.discord_bot_url.clone()).await;
 
     // 1. PostgreSQL database connection & migrations
     let db_pool = storage::db::init_db(&config.database_url).await?;

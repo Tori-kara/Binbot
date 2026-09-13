@@ -54,6 +54,7 @@ If you prefer manual setup without Blueprints:
 | `DATABASE_URL` | **Yes** | `postgres://user:pass@host/binbot` | PostgreSQL connection string |
 | `REDIS_URL` | **Yes** | `redis://default:pass@host:6379` | Redis connection string |
 | `DISCORD_TOKEN` | **Yes** | `MTE...` | Discord bot application token |
+| `DISCORD_BOT_URL` | No | `https://discord.com/oauth2/authorize?...` | Discord bot invitation link (shown on web root UI & `/invite`) |
 | `DISCORD_GUILD_ID` | No | `123456789012345678` | Server ID for guild-scoped commands |
 | `PORT` | Auto | `10000` | Port for healthcheck (injected by Render) |
 | `RUST_LOG` | No | `info` | Logging verbosity |
@@ -79,11 +80,12 @@ Rust release builds with high dependency counts can hit Render's 15-minute build
 
 ---
 
-## How the Health Check Works
+## How the Web Server & Health Check Work
 
 Render Web Services require listening on the `$PORT` environment variable (default `10000`).
-Binbot runs an internal lightweight Axum health check server on `$PORT`:
-- `GET /` → `200 OK`
-- `GET /healthz` → `200 OK`
+Binbot runs an internal lightweight Axum web server on `$PORT`:
+- `GET /` → `200 OK` (Serves an interactive dark-themed landing page with system status & **Discord Bot Invitation** CTA button)
+- `GET /invite` → `307 Temporary Redirect` (Redirects directly to `DISCORD_BOT_URL` so server owners can invite the bot via a clean link)
+- `GET /healthz` → `200 OK` (Returns JSON `{"status": "ok", "app": "binbot", "discord_bot_url": "..."}`)
 
-This ensures Render's health monitor marks the deployment green immediately upon launch.
+This ensures Render's health monitor marks the deployment green immediately upon launch while providing a public-facing portal for guild installation.

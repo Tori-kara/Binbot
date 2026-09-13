@@ -120,7 +120,9 @@ flowchart TD
 ### 6. Health & Monitoring Web Server (`src/web.rs`)
 
 - **Axum Web Server**: Runs a lightweight background HTTP listener binding to `$PORT` (default `10000`).
-- **Health Endpoints**: Exposes `GET /` and `GET /healthz` returning `{"status": "ok", "app": "binbot"}` for container health probes (Render, Kubernetes, Docker Engine).
+- **Web Landing Page & Invite Portal**: `GET /` serves an interactive, dark-themed HTML portal displaying live system status and a prominent **"🤖 Add Binbot to Discord Server"** call-to-action button.
+- **Direct Invite Route**: `GET /invite` performs a `307 Temporary Redirect` straight to `DISCORD_BOT_URL`.
+- **Health Endpoints**: Exposes `GET /healthz` returning JSON `{"status": "ok", "app": "binbot", "discord_bot_url": "..."}` for container health probes (Render, Kubernetes, Docker Engine).
 
 ### 7. Database & Storage Layer (`src/storage/`, `migrations/`)
 
@@ -215,6 +217,7 @@ Environment configuration is managed via standard system environment variables o
 | `DATABASE_URL`                      | **Yes**  | `postgres://user:pass@localhost:5432/binbot` | PostgreSQL database connection string                            |
 | `REDIS_URL`                         | **Yes**  | `redis://127.0.0.1:6379`                     | Redis connection URL for FX rate caching                         |
 | `DISCORD_TOKEN`                     | **Yes**  | `MTE...`                                     | Discord Bot Application OAuth2 token                             |
+| `DISCORD_BOT_URL`                   |    No    | `https://discord.com/oauth2/authorize?...`   | Discord Bot Invitation URL (exposed on Web UI & `/invite`)        |
 | `DISCORD_GUILD_ID`                  |    No    | `123456789012345678`                         | Server ID for instant testing command registration               |
 | `PORT`                              |    No    | `10000`                                      | Port for Axum `/healthz` HTTP health server                      |
 | `CURRENCY_CHECK_INTERVAL_HOURS`     |    No    | `3`                                          | Interval (in hours) between FX differential checks               |

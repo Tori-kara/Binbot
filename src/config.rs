@@ -7,6 +7,7 @@ pub struct Config {
     pub binance_raw: String,
     pub binance_combined: String,
     pub discord_token: String,
+    pub discord_bot_url: Option<String>,
     pub discord_guild_id: Option<u64>,
     pub port: u16,
 }
@@ -21,6 +22,8 @@ impl Config {
             .map_err(|_| "REDIS_URL is required (set in environment or .env)")?;
         let discord_token = env::var("DISCORD_TOKEN")
             .map_err(|_| "DISCORD_TOKEN is required (set in environment or .env)")?;
+
+        let discord_bot_url = env::var("DISCORD_BOT_URL").ok();
 
         let binance_raw = env::var("BINANCE_WEBSOCKET_RAW_ENDPOINT")
             .unwrap_or_else(|_| "wss://stream.binance.com:9443/ws".to_string());
@@ -42,6 +45,7 @@ impl Config {
             binance_raw,
             binance_combined,
             discord_token,
+            discord_bot_url,
             discord_guild_id,
             port,
         })
