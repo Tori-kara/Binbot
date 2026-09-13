@@ -335,6 +335,34 @@ Binbot includes a ready-to-use Render Blueprint definition:
 3. Render automatically provisions a managed PostgreSQL database and Docker Web Service listening on `/healthz`.
 4. Supply your `DISCORD_TOKEN` and `REDIS_URL` in the Render environment settings.
 
+### ⏰ Render Sleep Behavior & Automated Wake-up Tooling
+
+Render Free tier web services spin down after 15 minutes of inbound HTTP inactivity. Binbot provides built-in tools to manage and automate service wake-up:
+
+#### 1. Discord Slash Command (`/wakeup`)
+- Run `/wakeup` inside any Discord channel where Binbot is present.
+- Responds with live status for the Axum web health server, Binance WebSocket stream subscriptions, PostgreSQL, and Redis connections.
+
+#### 2. Automated Check-and-Wake Command Runner (`scripts/wakeup.sh` & `scripts/wakeup.ps1`)
+The automated runner performs a rapid status check (`/healthz`).
+- **If Awake**: Executes your target command immediately (0 delay).
+- **If Sleeping**: Sends a wake-up ping to trigger Render instance boot, polls until ready (`200 OK`), and then automatically executes your command!
+
+**Usage Examples:**
+
+```bash
+# Linux / macOS (Bash)
+./scripts/wakeup.sh https://binbot.onrender.com
+./scripts/wakeup.sh https://binbot.onrender.com cargo test
+
+# Windows (PowerShell)
+.\scripts\wakeup.ps1 -BackendUrl "https://binbot.onrender.com"
+.\scripts\wakeup.ps1 -BackendUrl "https://binbot.onrender.com" -Command "cargo test"
+```
+
+#### 3. Zero-Downtime 24/7 Keep-Alive
+To prevent Render from ever going to sleep, configure a free external ping monitor (such as [UptimeRobot](https://uptimerobot.com) or a 14-minute GitHub Action cron) to send a `GET` request to `https://<your-app>.onrender.com/healthz` every 14 minutes.
+
 ---
 
 ## 📁 Directory Structure
@@ -376,7 +404,8 @@ Binbot/
     │   ├── notifier.rs        # Market event notifier
     │   └── commands/          # Poise slash commands
     │       ├── price.rs       # /price command with interactive autocomplete
-    │       └── currencies.rs  # /currencies command displaying live exchange rates
+    │       ├── currencies.rs  # /currencies command displaying live exchange rates
+    │       └── wakeup.rs      # /wakeup command for verifying Render service status
     └── storage/               # Infrastructure persistence adapters
         ├── db.rs              # SQLx PostgreSQL pool initializer & migration runner
         └── redis.rs           # Redis async connection factory w/ retry handling
