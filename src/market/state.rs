@@ -4,18 +4,29 @@ use rust_decimal::Decimal;
 use tokio::sync::RwLock;
 
 use crate::market::models::MarketData;
+use crate::storage::redis::RedisStore;
 
-/// Thread-safe in-memory cache for market data
+/// Thread-safe in-memory cache for market data with optional Redis fallback
 #[derive(Debug, Clone, Default)]
 pub struct MarketState {
     data: Arc<RwLock<HashMap<String, MarketData>>>,
+    redis: Option<RedisStore>,
 }
 
 impl MarketState {
-    /// Creates a new empty `MarketState`
+    /// Creates a new empty `MarketState` without Redis
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            redis: None,
+        }
+    }
+
+    /// Creates a `MarketState` with a Redis store for distributed cache lookup
+    pub fn with_redis(redis: RedisStore) -> Self {
+        Self {
+            data: Arc::new(RwLock::new(HashMap::new())),
+            redis: Some(redis),
         }
     }
 
@@ -29,18 +40,42 @@ impl MarketState {
         prev_price
     }
 
-    /// Retrieves the current price for a symbol (case-insensitive)
+    /// Retrieves the current price for a symbol (case-insensitive).
+    /// If not present in-memory, attempts to query Redis.
     pub async fn get_price(&self, symbol: &str) -> Option<Decimal> {
         let key = symbol.to_uppercase();
-        let map = self.data.read().await;
-        map.get(&key).map(|d| d.price)
+        {
+            let map = self.data.read().await;
+            if let Some(d) = map.get(&key) {
+                return Some(d.price);
+            }
+        }
+
+        self.get_snapshot(symbol).await.map(|d| d.price)
     }
 
-    /// Retrieves a cloned snapshot of the market data for a symbol (case-insensitive)
+    /// Retrieves a cloned snapshot of the market data for a symbol (case-insensitive).
+    /// If not present in-memory, attempts to query Redis `market:{SYMBOL}`.
     pub async fn get_snapshot(&self, symbol: &str) -> Option<MarketData> {
         let key = symbol.to_uppercase();
-        let map = self.data.read().await;
-        map.get(&key).cloned()
+        {
+            let map = self.data.read().await;
+            if let Some(d) = map.get(&key) {
+                return Some(d.clone());
+            }
+        }
+
+        // Fallback to Redis if configured
+        if let Some(redis) = &self.redis {
+            if let Ok(Some(remote_data)) = redis.get_market_snapshot(&key).await {
+                // Populate in-memory cache
+                let mut map = self.data.write().await;
+                map.insert(key, remote_data.clone());
+                return Some(remote_data);
+            }
+        }
+
+        None
     }
 
     /// Retrieves a list of all currently tracked symbols (for Discord autocomplete)
@@ -55,7 +90,7 @@ impl MarketState {
         map.values().cloned().collect()
     }
 
-    /// Returns the total number of tracked symbols
+    /// Returns the total number of tracked symbols in local memory
     pub async fn count(&self) -> usize {
         let map = self.data.read().await;
         map.len()

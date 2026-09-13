@@ -181,3 +181,137 @@ pub fn create_not_found_embed(query: &str, tracked_symbols: &[String]) -> Create
         .footer(CreateEmbedFooter::new("BinBot • Symbol Lookup"))
         .timestamp(Timestamp::from_unix_timestamp(Utc::now().timestamp()).unwrap_or_else(|_| Timestamp::now()))
 }
+
+pub fn create_alert_triggered_embed(notif: &crate::alerts::AlertNotification) -> CreateEmbed {
+    let is_upward = notif.condition.is_upward();
+    let color = if is_upward { 0x2ECC71 } else { 0xE74C3C };
+    let trend_emoji = if is_upward { "🚀" } else { "🔻" };
+
+    let condition_str = match notif.condition {
+        crate::alerts::AlertCondition::PriceAbove(p) => format!("Price Above {}", format_usd_price(p)),
+        crate::alerts::AlertCondition::PriceBelow(p) => format!("Price Below {}", format_usd_price(p)),
+        crate::alerts::AlertCondition::PercentageChange(pct) => {
+            let base_str = notif
+                .baseline_price
+                .map(format_usd_price)
+                .unwrap_or_else(|| "N/A".to_string());
+            format!("Move of {:+}% (from {})", pct, base_str)
+        }
+    };
+
+    let reset_price = notif
+        .condition
+        .compute_reset_price(notif.baseline_price, crate::alerts::DEFAULT_HYSTERESIS_RATE);
+
+    let reset_desc = if is_upward {
+        format!("Drops below {} (0.5% hysteresis)", format_usd_price(reset_price))
+    } else {
+        format!("Rises above {} (0.5% hysteresis)", format_usd_price(reset_price))
+    };
+
+    let prev_str = notif
+        .previous_price
+        .map(format_usd_price)
+        .unwrap_or_else(|| "N/A".to_string());
+
+    let ts = Timestamp::from_unix_timestamp(notif.triggered_at.timestamp())
+        .unwrap_or_else(|_| Timestamp::now());
+
+    CreateEmbed::new()
+        .title(format!("{} Alert Triggered: {}", trend_emoji, notif.symbol))
+        .color(color)
+        .field("Triggered Price", format_usd_price(notif.trigger_price), true)
+        .field("Previous Price", prev_str, true)
+        .field("Target Condition", condition_str, false)
+        .field("Hysteresis Reset Band", reset_desc, false)
+        .footer(CreateEmbedFooter::new(format!(
+            "Binbot Alert Engine • Alert #{} • Cooldown Active",
+            notif.alert_id
+        )))
+        .timestamp(ts)
+}
+
+pub fn create_watch_success_embed(alert: &crate::alerts::Alert, current_price: Decimal) -> CreateEmbed {
+    let target = alert.target_price();
+    let reset = alert.reset_price(crate::alerts::DEFAULT_HYSTERESIS_RATE);
+
+    let condition_str = match alert.condition {
+        crate::alerts::AlertCondition::PriceAbove(p) => format!("Price Above {}", format_usd_price(p)),
+        crate::alerts::AlertCondition::PriceBelow(p) => format!("Price Below {}", format_usd_price(p)),
+        crate::alerts::AlertCondition::PercentageChange(pct) => {
+            format!("{:+}% from baseline", pct)
+        }
+    };
+
+    let reset_desc = if alert.is_upward() {
+        format!("Re-arms when drops below {}", format_usd_price(reset))
+    } else {
+        format!("Re-arms when rises above {}", format_usd_price(reset))
+    };
+
+    CreateEmbed::new()
+        .title(format!("🔔 Watch Alert Created: {}", alert.symbol))
+        .description(format!(
+            "Alert **#{}** registered! You will be notified in this channel when **{}** reaches the threshold.",
+            alert.id, alert.symbol
+        ))
+        .color(0x3498DB)
+        .field("Current Price", format_usd_price(current_price), true)
+        .field("Target Price", format_usd_price(target), true)
+        .field("Condition", condition_str, true)
+        .field("Hysteresis Reset", reset_desc, false)
+        .field(
+            "Cooldown",
+            format!("{} minutes", alert.cooldown_seconds / 60),
+            true,
+        )
+        .field("Status", "🟢 Armed", true)
+        .footer(CreateEmbedFooter::new("Binbot • Automated Market Monitor"))
+        .timestamp(Timestamp::now())
+}
+
+pub fn create_alert_list_embed(alerts: &[crate::alerts::Alert], username: &str) -> CreateEmbed {
+    if alerts.is_empty() {
+        return CreateEmbed::new()
+            .title(format!("🔔 Active Alerts for {}", username))
+            .description("You do not have any active alerts.\nUse `/watch <symbol> <condition>` to set one!")
+            .color(0x3498DB)
+            .footer(CreateEmbedFooter::new("Binbot • Alerts Manager"));
+    }
+
+    let mut lines = Vec::new();
+    for a in alerts {
+        let status = if a.is_triggered {
+            "🔴 Waiting Reset"
+        } else {
+            "🟢 Armed"
+        };
+
+        let cond = match a.condition {
+            crate::alerts::AlertCondition::PriceAbove(p) => format!("Above {}", format_usd_price(p)),
+            crate::alerts::AlertCondition::PriceBelow(p) => format!("Below {}", format_usd_price(p)),
+            crate::alerts::AlertCondition::PercentageChange(pct) => format!("{:+}%", pct),
+        };
+
+        lines.push(format!(
+            "**#{}** • **`{}`** — {} (Target: {}) • {}\n*Cooldown: {}m | Channel: <#{}>*",
+            a.id,
+            a.symbol,
+            cond,
+            format_usd_price(a.target_price()),
+            status,
+            a.cooldown_seconds / 60,
+            a.channel_discord_id
+        ));
+    }
+
+    CreateEmbed::new()
+        .title(format!("🔔 Active Alerts for {} ({})", username, alerts.len()))
+        .description(format!(
+            "{}\n\n*To remove an alert, use `/alerts delete <id>`*",
+            lines.join("\n\n")
+        ))
+        .color(0x3498DB)
+        .footer(CreateEmbedFooter::new("Binbot • Alerts Manager"))
+        .timestamp(Timestamp::now())
+}

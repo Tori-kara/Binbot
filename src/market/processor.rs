@@ -5,19 +5,33 @@ use tracing::{debug, trace};
 use crate::binance::BinanceEvent;
 use crate::market::models::{MarketData, MarketUpdateEvent, Ohlc};
 use crate::market::state::MarketState;
+use crate::storage::redis::RedisStore;
+
+/// Default TTL for cached market snapshots in Redis (60 seconds)
+pub const MARKET_SNAPSHOT_TTL_SECS: u64 = 60;
 
 /// Processes raw Binance exchange events into normalized domain models,
-/// updates the in-memory `MarketState`, and broadcasts `MarketUpdateEvent`s
-/// for downstream consumers (such as the Alert Engine).
+/// updates the in-memory `MarketState`, caches volatile state to Redis,
+/// and broadcasts `MarketUpdateEvent`s for downstream consumers.
 #[derive(Debug, Clone)]
 pub struct MarketProcessor {
     state: MarketState,
     update_tx: broadcast::Sender<MarketUpdateEvent>,
+    redis: Option<RedisStore>,
 }
 
 impl MarketProcessor {
     pub fn new(state: MarketState, update_tx: broadcast::Sender<MarketUpdateEvent>) -> Self {
-        Self { state, update_tx }
+        Self {
+            state,
+            update_tx,
+            redis: None,
+        }
+    }
+
+    pub fn with_redis(mut self, redis: RedisStore) -> Self {
+        self.redis = Some(redis);
+        self
     }
 
     /// Access the underlying `MarketState`
@@ -42,6 +56,17 @@ impl MarketProcessor {
 
                 if previous_price.is_none() {
                     tracing::info!("✓ Now tracking: {} @ ${}", symbol, market_data.price);
+                }
+
+                // Offload market snapshot to Redis: market:{SYMBOL} with 60s TTL
+                if let Some(redis) = &self.redis {
+                    let r = redis.clone();
+                    let data = market_data.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = r.set_market_snapshot(&data, MARKET_SNAPSHOT_TTL_SECS).await {
+                            tracing::trace!("Failed to write market snapshot to Redis: {e}");
+                        }
+                    });
                 }
 
                 trace!(

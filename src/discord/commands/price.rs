@@ -5,7 +5,7 @@ use crate::discord::bot::{Context, Error};
 use crate::discord::embeds;
 
 /// Autocomplete suggestions for cryptocurrency symbols based on live in-memory state
-async fn autocomplete_symbol(
+pub(crate) async fn autocomplete_symbol(
     ctx: Context<'_>,
     partial: &str,
 ) -> serenity::CreateAutocompleteResponse {

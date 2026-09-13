@@ -1,3 +1,4 @@
+mod alerts;
 mod binance;
 mod config;
 mod currency;
@@ -144,25 +145,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 5. Market Data Engine
-    let market_state = MarketState::new();
+    let redis_store = storage::redis::RedisStore::new(redis_conn.clone());
+    let market_state = MarketState::with_redis(redis_store.clone());
     let (update_tx, _update_rx) = tokio::sync::broadcast::channel(16384);
-    let processor = MarketProcessor::new(market_state.clone(), update_tx);
-    tracing::info!("✓ Market Data Engine initialized");
+    let alert_market_rx = update_tx.subscribe();
+    let processor = MarketProcessor::new(market_state.clone(), update_tx)
+        .with_redis(redis_store.clone());
+    tracing::info!("✓ Market Data Engine initialized (with Redis volatile state caching)");
 
     // Spawn background market data processor
     tokio::spawn(async move {
         processor.run(event_rx).await;
     });
 
-    // 6. Discord Bot Integration
+    // 6. Alert Engine & Store
+    let alert_store = Arc::new(
+        alerts::AlertStore::new(db_pool.clone()).with_redis(redis_store.clone())
+    );
+    match alert_store.load_all_active_alerts().await {
+        Ok(count) => {
+            tracing::info!("✓ Hydrated {count} active alert rules from PostgreSQL");
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load active alerts from database: {e}");
+        }
+    }
+    let (alert_notif_tx, alert_notif_rx) = tokio::sync::mpsc::channel(1000);
+    let alert_engine = alerts::AlertEngine::new(alert_store.clone(), alert_notif_tx);
+
+    tokio::spawn(async move {
+        alert_engine.run(alert_market_rx).await;
+    });
+    tracing::info!("✓ Alert Engine & Distributed Cooldown Processor initialized");
+
+    // 7. Discord Bot Integration
     let discord_token = config.discord_token.clone();
     let discord_guild_id = config.discord_guild_id;
     let bot_market_state = market_state.clone();
     let bot_currency_service = currency_service.clone();
+    let bot_alert_store = alert_store.clone();
 
     let _bot_handle = tokio::spawn(async move {
-        if let Err(e) =
-            discord::run_bot(discord_token, bot_market_state, bot_currency_service, discord_guild_id).await
+        if let Err(e) = discord::run_bot(
+            discord_token,
+            bot_market_state,
+            bot_currency_service,
+            bot_alert_store,
+            alert_notif_rx,
+            discord_guild_id,
+        )
+        .await
         {
             tracing::error!("Discord bot stopped with error: {:?}", e);
         }
