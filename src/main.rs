@@ -53,31 +53,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("✓ PostgreSQL connected & migrations up to date");
 
     // 2. Redis connection
-    let mut redis_conn = match storage::redis::init_redis(&config.redis_url).await {
-        Ok(conn) => conn,
-        Err(err) => {
-            tracing::error!("Redis initialization failed: {err}");
-            return Err(format!("Redis connection failed: {err}").into());
-        }
-    };
-    let _pong: String = match tokio::time::timeout(
-        Duration::from_secs(5),
-        redis::cmd("PING").query_async(&mut redis_conn),
-    )
-    .await
-    {
-        Ok(Ok(res)) => res,
-        Ok(Err(err)) => {
-            tracing::error!("Redis PING failed: {err}");
-            return Err(format!("Redis PING failed: {err}").into());
-        }
-        Err(_) => {
-            tracing::error!("Redis PING timed out after 5s");
-            return Err("Redis PING timed out after 5s".into());
-        }
-    };
-    tracing::info!("✓ Redis connected & verified");
+    let (redis_conn_opt, redis_store_opt) = match storage::redis::init_redis(&config.redis_url).await {
+        Ok(mut conn) => {
+            let ping_res = tokio::time::timeout(
+                Duration::from_secs(5),
+                redis::cmd("PING").query_async::<String>(&mut conn),
+            )
+            .await;
 
+            match ping_res {
+                Ok(Ok(_pong)) => {
+                    tracing::info!("✓ Redis connected & verified");
+                    let store = storage::redis::RedisStore::new(conn.clone());
+                    (Some(conn), Some(store))
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!("Redis PING failed: {err}. Operating in high-performance in-memory fallback mode.");
+                    (None, None)
+                }
+                Err(_) => {
+                    tracing::warn!("Redis PING timed out after 5s. Operating in high-performance in-memory fallback mode.");
+                    (None, None)
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!("Redis initialization failed: {err}. Operating in high-performance in-memory fallback mode.");
+            (None, None)
+        }
+    };
 
     // 3. Binance WebSocket connection
     let ws_config = BinanceWsConfig::new(&config.binance_raw);
@@ -132,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let check_interval = Duration::from_secs(check_interval_hours * 3600);
 
     let currency_service = Arc::new(CurrencyService::new(
-        Some(redis_conn.clone()),
+        redis_conn_opt.clone(),
         rust_decimal_macros::dec!(0.1),
     ));
     currency_service.init_cache().await;
@@ -140,18 +144,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .spawn_interval_checker(check_interval);
     tracing::info!(
-        "✓ Fiat Currency Engine initialized (interval check: {}h, Redis cache active)",
-        check_interval_hours
+        "✓ Fiat Currency Engine initialized (interval check: {}h, Redis active: {})",
+        check_interval_hours,
+        redis_conn_opt.is_some()
     );
 
     // 5. Market Data Engine
-    let redis_store = storage::redis::RedisStore::new(redis_conn.clone());
-    let market_state = MarketState::with_redis(redis_store.clone());
+    let market_state = match &redis_store_opt {
+        Some(store) => MarketState::with_redis(store.clone()),
+        None => MarketState::new(),
+    };
     let (update_tx, _update_rx) = tokio::sync::broadcast::channel(16384);
     let alert_market_rx = update_tx.subscribe();
-    let processor = MarketProcessor::new(market_state.clone(), update_tx)
-        .with_redis(redis_store.clone());
-    tracing::info!("✓ Market Data Engine initialized (with Redis volatile state caching)");
+    let mut processor = MarketProcessor::new(market_state.clone(), update_tx);
+    if let Some(store) = &redis_store_opt {
+        processor = processor
+            .with_redis(store.clone())
+            .with_redis_cache_config(
+                config.redis_market_cache_enabled,
+                config.redis_market_cache_interval_secs,
+            );
+    }
+    tracing::info!(
+        "✓ Market Data Engine initialized (Redis cache: enabled={}, interval={}s)",
+        config.redis_market_cache_enabled,
+        config.redis_market_cache_interval_secs
+    );
 
     // Spawn background market data processor
     tokio::spawn(async move {
@@ -159,9 +177,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 6. Alert Engine & Store
-    let alert_store = Arc::new(
-        alerts::AlertStore::new(db_pool.clone()).with_redis(redis_store.clone())
-    );
+    let mut alert_store_builder = alerts::AlertStore::new(db_pool.clone());
+    if let Some(store) = &redis_store_opt {
+        alert_store_builder = alert_store_builder.with_redis(store.clone());
+    }
+    let alert_store = Arc::new(alert_store_builder);
     match alert_store.load_all_active_alerts().await {
         Ok(count) => {
             tracing::info!("✓ Hydrated {count} active alert rules from PostgreSQL");

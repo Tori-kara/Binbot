@@ -1,3 +1,8 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+
 use chrono::DateTime;
 use tokio::sync::broadcast;
 use tracing::{debug, trace};
@@ -11,13 +16,16 @@ use crate::storage::redis::RedisStore;
 pub const MARKET_SNAPSHOT_TTL_SECS: u64 = 60;
 
 /// Processes raw Binance exchange events into normalized domain models,
-/// updates the in-memory `MarketState`, caches volatile state to Redis,
+/// updates the in-memory `MarketState`, optionally caches volatile state to Redis (throttled),
 /// and broadcasts `MarketUpdateEvent`s for downstream consumers.
 #[derive(Debug, Clone)]
 pub struct MarketProcessor {
     state: MarketState,
     update_tx: broadcast::Sender<MarketUpdateEvent>,
     redis: Option<RedisStore>,
+    redis_cache_enabled: bool,
+    redis_sync_interval: Duration,
+    last_redis_sync: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl MarketProcessor {
@@ -26,11 +34,20 @@ impl MarketProcessor {
             state,
             update_tx,
             redis: None,
+            redis_cache_enabled: false,
+            redis_sync_interval: Duration::from_secs(60),
+            last_redis_sync: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub fn with_redis(mut self, redis: RedisStore) -> Self {
         self.redis = Some(redis);
+        self
+    }
+
+    pub fn with_redis_cache_config(mut self, enabled: bool, interval_secs: u64) -> Self {
+        self.redis_cache_enabled = enabled;
+        self.redis_sync_interval = Duration::from_secs(interval_secs);
         self
     }
 
@@ -58,15 +75,32 @@ impl MarketProcessor {
                     tracing::info!("✓ Now tracking: {} @ ${}", symbol, market_data.price);
                 }
 
-                // Offload market snapshot to Redis: market:{SYMBOL} with 60s TTL
-                if let Some(redis) = &self.redis {
-                    let r = redis.clone();
-                    let data = market_data.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = r.set_market_snapshot(&data, MARKET_SNAPSHOT_TTL_SECS).await {
-                            tracing::trace!("Failed to write market snapshot to Redis: {e}");
+                // Offload market snapshot to Redis only if explicitly enabled and throttled
+                if self.redis_cache_enabled {
+                    if let Some(redis) = &self.redis {
+                        let should_sync = {
+                            let map = self.last_redis_sync.read().await;
+                            match map.get(&symbol) {
+                                Some(last) => last.elapsed() >= self.redis_sync_interval,
+                                None => true,
+                            }
+                        };
+
+                        if should_sync {
+                            {
+                                let mut map = self.last_redis_sync.write().await;
+                                map.insert(symbol.clone(), Instant::now());
+                            }
+                            let r = redis.clone();
+                            let data = market_data.clone();
+                            let ttl = (self.redis_sync_interval.as_secs() * 2).max(MARKET_SNAPSHOT_TTL_SECS);
+                            tokio::spawn(async move {
+                                if let Err(e) = r.set_market_snapshot(&data, ttl).await {
+                                    tracing::trace!("Failed to write market snapshot to Redis: {e}");
+                                }
+                            });
                         }
-                    });
+                    }
                 }
 
                 trace!(

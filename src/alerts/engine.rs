@@ -259,20 +259,6 @@ impl AlertEngine {
         let now = Utc::now();
 
         for alert in alerts {
-            // Check distributed Redis cooldown state
-            let is_cooling = self.store.is_cooling_down(
-                alert.id,
-                alert.last_triggered_at,
-                alert.cooldown_seconds,
-                now,
-            ).await;
-
-            // If Redis indicates cooling down but in-memory last_triggered_at is missing, hydrate it
-            let mut alert_eval_copy = alert.clone();
-            if is_cooling && alert_eval_copy.last_triggered_at.is_none() {
-                alert_eval_copy.last_triggered_at = Some(now);
-            }
-
             // Retrieve rolling window stats if needed by condition
             let rolling_stats = if let Some(dur) = find_window_duration(&alert.condition) {
                 if let Some(ref ms) = self.market_state {
@@ -285,7 +271,7 @@ impl AlertEngine {
             };
 
             let eval = evaluate_alert(
-                &alert_eval_copy,
+                &alert,
                 market_data,
                 rolling_stats.as_ref(),
                 previous_price,
@@ -295,7 +281,7 @@ impl AlertEngine {
 
             match eval {
                 AlertEvaluation::Triggered { trigger_price, previous_price } => {
-                    // Atomically acquire Redis cooldown lock
+                    // Atomically acquire Redis cooldown lock (prioritizes memory, then SET NX)
                     let acquired = self.store.try_acquire_cooldown(
                         alert.id,
                         alert.cooldown_seconds,
@@ -304,12 +290,17 @@ impl AlertEngine {
                     ).await;
 
                     if !acquired {
-                        let remaining = self.store.get_cooldown_remaining(
-                            alert.id,
+                        // Cooldown is active in Redis: hydrate in-memory state to suppress future ticks in RAM
+                        self.store
+                            .update_trigger_state(alert.id, &alert.symbol, true, Some(now))
+                            .await;
+
+                        let remaining = CooldownTracker::time_remaining(
                             alert.last_triggered_at,
                             alert.cooldown_seconds,
                             now,
-                        ).await.unwrap_or_else(Duration::zero);
+                        )
+                        .unwrap_or_else(|| Duration::seconds(alert.cooldown_seconds as i64));
 
                         trace!(
                             alert_id = alert.id,
