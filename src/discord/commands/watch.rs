@@ -10,7 +10,7 @@ pub async fn watch(
     #[description = "Cryptocurrency ticker symbol (e.g. BTC, ETH, SOL)"]
     #[autocomplete = "autocomplete_symbol"]
     symbol: String,
-    #[description = "Alert condition (e.g. +5%, -3%, > 100000, < 4000)"]
+    #[description = "Condition (e.g. +5%, Price > 100k AND Volume_24h > 50B, Moved > 3% in 5m)"]
     condition: String,
     #[description = "Cooldown period in minutes before re-triggering (default: 30)"]
     cooldown_minutes: Option<u32>,
@@ -42,7 +42,7 @@ pub async fn watch(
 
     let current_price = snapshot.price;
 
-    // Parse the condition input
+    // Parse the condition input (supporting composite and rolling conditions)
     let parsed_cond = match parse_condition(&condition, current_price) {
         Ok(c) => c,
         Err(err_msg) => {
@@ -56,10 +56,19 @@ pub async fn watch(
         }
     };
 
-    // For PercentageChange, save baseline price as current market price
-    let baseline_price = match parsed_cond {
-        AlertCondition::PercentageChange(_) => Some(current_price),
-        _ => None,
+    // If condition contains PercentageChange, record current price as baseline
+    fn has_percentage_change(c: &AlertCondition) -> bool {
+        match c {
+            AlertCondition::PercentageChange(_) => true,
+            AlertCondition::All(items) | AlertCondition::Any(items) => items.iter().any(has_percentage_change),
+            _ => false,
+        }
+    }
+
+    let baseline_price = if has_percentage_change(&parsed_cond) {
+        Some(current_price)
+    } else {
+        None
     };
 
     let cooldown_secs = cooldown_minutes.unwrap_or(30).max(1) * 60;

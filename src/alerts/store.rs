@@ -63,11 +63,27 @@ impl AlertStore {
         for row in rows {
             let id = row.id;
             let symbol = row.symbol;
-            let condition = match AlertCondition::from_parts(&row.condition_type, row.threshold) {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Skipping corrupt alert #{id}: {e}");
-                    continue;
+            let condition = if let Some(ref payload) = row.condition_payload {
+                match serde_json::from_value::<AlertCondition>(payload.clone()) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        warn!("Failed to deserialize condition_payload for alert #{id}: {err}, falling back to legacy parts");
+                        match AlertCondition::from_parts(&row.condition_type, row.threshold) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("Skipping corrupt alert #{id}: {e}");
+                                continue;
+                            }
+                        }
+                    }
+                }
+            } else {
+                match AlertCondition::from_parts(&row.condition_type, row.threshold) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Skipping corrupt alert #{id}: {e}");
+                        continue;
+                    }
                 }
             };
 
@@ -141,6 +157,7 @@ impl AlertStore {
         // 4. Insert Alert in PostgreSQL
         let condition_type = condition.condition_type_str();
         let threshold = condition.threshold_value();
+        let condition_payload = serde_json::to_value(&condition).ok();
 
         let alert_row = self
             .repo
@@ -152,6 +169,7 @@ impl AlertStore {
                 condition_type,
                 threshold,
                 baseline_price,
+                condition_payload,
                 cooldown_seconds as i32,
             )
             .await?;

@@ -187,26 +187,20 @@ pub fn create_alert_triggered_embed(notif: &crate::alerts::AlertNotification) ->
     let color = if is_upward { 0x2ECC71 } else { 0xE74C3C };
     let trend_emoji = if is_upward { "🚀" } else { "🔻" };
 
-    let condition_str = match notif.condition {
-        crate::alerts::AlertCondition::PriceAbove(p) => format!("Price Above {}", format_usd_price(p)),
-        crate::alerts::AlertCondition::PriceBelow(p) => format!("Price Below {}", format_usd_price(p)),
-        crate::alerts::AlertCondition::PercentageChange(pct) => {
-            let base_str = notif
-                .baseline_price
-                .map(format_usd_price)
-                .unwrap_or_else(|| "N/A".to_string());
-            format!("Move of {:+}% (from {})", pct, base_str)
-        }
-    };
+    let condition_str = notif.condition.display_string();
 
     let reset_price = notif
         .condition
         .compute_reset_price(notif.baseline_price, crate::alerts::DEFAULT_HYSTERESIS_RATE);
 
-    let reset_desc = if is_upward {
-        format!("Drops below {} (0.5% hysteresis)", format_usd_price(reset_price))
+    let reset_desc = if !reset_price.is_zero() {
+        if is_upward {
+            format!("Drops below {} (0.5% hysteresis)", format_usd_price(reset_price))
+        } else {
+            format!("Rises above {} (0.5% hysteresis)", format_usd_price(reset_price))
+        }
     } else {
-        format!("Rises above {} (0.5% hysteresis)", format_usd_price(reset_price))
+        "Re-arms when condition is no longer satisfied".to_string()
     };
 
     let prev_str = notif
@@ -235,30 +229,34 @@ pub fn create_watch_success_embed(alert: &crate::alerts::Alert, current_price: D
     let target = alert.target_price();
     let reset = alert.reset_price(crate::alerts::DEFAULT_HYSTERESIS_RATE);
 
-    let condition_str = match alert.condition {
-        crate::alerts::AlertCondition::PriceAbove(p) => format!("Price Above {}", format_usd_price(p)),
-        crate::alerts::AlertCondition::PriceBelow(p) => format!("Price Below {}", format_usd_price(p)),
-        crate::alerts::AlertCondition::PercentageChange(pct) => {
-            format!("{:+}% from baseline", pct)
+    let condition_str = alert.condition.display_string();
+
+    let reset_desc = if !reset.is_zero() {
+        if alert.is_upward() {
+            format!("Re-arms when drops below {}", format_usd_price(reset))
+        } else {
+            format!("Re-arms when rises above {}", format_usd_price(reset))
         }
+    } else {
+        "Re-arms when condition is no longer met".to_string()
     };
 
-    let reset_desc = if alert.is_upward() {
-        format!("Re-arms when drops below {}", format_usd_price(reset))
+    let target_display = if !target.is_zero() {
+        format_usd_price(target)
     } else {
-        format!("Re-arms when rises above {}", format_usd_price(reset))
+        "Dynamic / Composite".to_string()
     };
 
     CreateEmbed::new()
         .title(format!("🔔 Watch Alert Created: {}", alert.symbol))
         .description(format!(
-            "Alert **#{}** registered! You will be notified in this channel when **{}** reaches the threshold.",
+            "Alert **#{}** registered! You will be notified in this channel when **{}** satisfies the condition.",
             alert.id, alert.symbol
         ))
         .color(0x3498DB)
         .field("Current Price", format_usd_price(current_price), true)
-        .field("Target Price", format_usd_price(target), true)
-        .field("Condition", condition_str, true)
+        .field("Target", target_display, true)
+        .field("Condition", condition_str, false)
         .field("Hysteresis Reset", reset_desc, false)
         .field(
             "Cooldown",
@@ -287,18 +285,19 @@ pub fn create_alert_list_embed(alerts: &[crate::alerts::Alert], username: &str) 
             "🟢 Armed"
         };
 
-        let cond = match a.condition {
-            crate::alerts::AlertCondition::PriceAbove(p) => format!("Above {}", format_usd_price(p)),
-            crate::alerts::AlertCondition::PriceBelow(p) => format!("Below {}", format_usd_price(p)),
-            crate::alerts::AlertCondition::PercentageChange(pct) => format!("{:+}%", pct),
+        let cond = a.condition.display_string();
+        let target_str = if !a.target_price().is_zero() {
+            format!("(Target: {})", format_usd_price(a.target_price()))
+        } else {
+            String::new()
         };
 
         lines.push(format!(
-            "**#{}** • **`{}`** — {} (Target: {}) • {}\n*Cooldown: {}m | Channel: <#{}>*",
+            "**#{}** • **`{}`** — {} {} • {}\n*Cooldown: {}m | Channel: <#{}>*",
             a.id,
             a.symbol,
             cond,
-            format_usd_price(a.target_price()),
+            target_str,
             status,
             a.cooldown_seconds / 60,
             a.channel_discord_id
@@ -314,4 +313,149 @@ pub fn create_alert_list_embed(alerts: &[crate::alerts::Alert], username: &str) 
         .color(0x3498DB)
         .footer(CreateEmbedFooter::new("Binbot • Alerts Manager"))
         .timestamp(Timestamp::now())
+}
+
+pub fn create_market_overview_embed(
+    digest: &crate::market::MarketDigest,
+    is_scheduled: bool,
+) -> CreateEmbed {
+    let title = if is_scheduled {
+        "📊 Daily Market Intelligence Digest (08:00 UTC)"
+    } else {
+        "📊 Cryptocurrency Market Overview"
+    };
+
+    let color = if digest.green_count >= digest.red_count {
+        0x2ECC71 // Green
+    } else {
+        0xE74C3C // Red
+    };
+
+    let sentiment_desc = format!(
+        "Tracking **{}** active market pairs across Binance.\n\
+        **Market Breadth:** 🟩 **{}** Advancing  |  🟥 **{}** Declining",
+        digest.tracked_count, digest.green_count, digest.red_count
+    );
+
+    // Format Top Gainers
+    let mut gainers_lines = Vec::new();
+    for (idx, g) in digest.top_gainers.iter().enumerate() {
+        let sym_clean = g.symbol.trim_end_matches("USDT");
+        gainers_lines.push(format!(
+            "{}. **{}** — `+{:.2}%` ({})",
+            idx + 1,
+            sym_clean,
+            g.price_change_percent_24hr,
+            format_usd_price(g.price)
+        ));
+    }
+    let gainers_text = if gainers_lines.is_empty() {
+        "No gainer data".to_string()
+    } else {
+        gainers_lines.join("\n")
+    };
+
+    // Format Top Losers
+    let mut losers_lines = Vec::new();
+    for (idx, l) in digest.top_losers.iter().enumerate() {
+        let sym_clean = l.symbol.trim_end_matches("USDT");
+        losers_lines.push(format!(
+            "{}. **{}** — `{:.2}%` ({})",
+            idx + 1,
+            sym_clean,
+            l.price_change_percent_24hr,
+            format_usd_price(l.price)
+        ));
+    }
+    let losers_text = if losers_lines.is_empty() {
+        "No loser data".to_string()
+    } else {
+        losers_lines.join("\n")
+    };
+
+    // Format Volume Leaders
+    let mut volume_lines = Vec::new();
+    for (idx, v) in digest.volume_leaders.iter().enumerate() {
+        let sym_clean = v.symbol.trim_end_matches("USDT");
+        let vol_str = if v.quote_volume_24hr >= rust_decimal_macros::dec!(1_000_000_000) {
+            format!("${:.2}B", v.quote_volume_24hr / rust_decimal_macros::dec!(1_000_000_000))
+        } else if v.quote_volume_24hr >= rust_decimal_macros::dec!(1_000_000) {
+            format!("${:.2}M", v.quote_volume_24hr / rust_decimal_macros::dec!(1_000_000))
+        } else {
+            format!("${:.2}", v.quote_volume_24hr)
+        };
+        volume_lines.push(format!(
+            "{}. **{}** — {} quote vol ({})",
+            idx + 1,
+            sym_clean,
+            vol_str,
+            format_usd_price(v.price)
+        ));
+    }
+    let volume_text = if volume_lines.is_empty() {
+        "No volume data".to_string()
+    } else {
+        volume_lines.join("\n")
+    };
+
+    // Format Major Benchmarks (BTC, ETH, SOL)
+    let mut bench_lines = Vec::new();
+    for b in &digest.benchmarks {
+        let sym_clean = b.symbol.trim_end_matches("USDT");
+        let sign = if b.price_change_percent_24hr >= Decimal::ZERO { "+" } else { "" };
+        bench_lines.push(format!(
+            "**{}**: {} (`{}{:.2}%`)",
+            sym_clean,
+            format_usd_price(b.price),
+            sign,
+            b.price_change_percent_24hr
+        ));
+    }
+    let bench_text = if bench_lines.is_empty() {
+        "N/A".to_string()
+    } else {
+        bench_lines.join("  •  ")
+    };
+
+    let footer_text = if is_scheduled {
+        "Binbot Daily Digest • Next Digest Tomorrow at 08:00 UTC"
+    } else {
+        "Binbot Market Intelligence • Live In-Memory Engine"
+    };
+
+    CreateEmbed::new()
+        .title(title)
+        .description(sentiment_desc)
+        .color(color)
+        .field("⚡ Benchmark Indices", bench_text, false)
+        .field("🚀 Top 24h Gainers", gainers_text, true)
+        .field("🔻 Top 24h Losers", losers_text, true)
+        .field("💎 24h Volume Leaders", volume_text, false)
+        .footer(CreateEmbedFooter::new(footer_text))
+        .timestamp(Timestamp::from_unix_timestamp(digest.generated_at.timestamp()).unwrap_or_else(|_| Timestamp::now()))
+}
+
+pub fn create_digest_subscription_embed(channel_discord_id: &str, is_subscribed: bool) -> CreateEmbed {
+    if is_subscribed {
+        CreateEmbed::new()
+            .title("📰 Daily Market Digest Subscribed")
+            .description(format!(
+                "✓ Channel <#{}> is now configured to receive the daily **Market Intelligence Digest** every morning at **08:00 UTC**.\n\n\
+                *To unsubscribe at any time, run `/market digest unsubscribe`.*",
+                channel_discord_id
+            ))
+            .color(0x2ECC71)
+            .footer(CreateEmbedFooter::new("Binbot • Daily Intelligence Scheduler"))
+            .timestamp(Timestamp::now())
+    } else {
+        CreateEmbed::new()
+            .title("📰 Daily Market Digest Unsubscribed")
+            .description(format!(
+                "✓ Channel <#{}> has been unsubscribed from scheduled daily market digests.",
+                channel_discord_id
+            ))
+            .color(0xF39C12)
+            .footer(CreateEmbedFooter::new("Binbot • Daily Intelligence Scheduler"))
+            .timestamp(Timestamp::now())
+    }
 }

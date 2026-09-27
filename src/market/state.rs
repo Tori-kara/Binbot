@@ -4,13 +4,16 @@ use rust_decimal::Decimal;
 use tokio::sync::RwLock;
 
 use crate::market::models::MarketData;
+use crate::market::rolling::{RollingMoveStats, RollingWindowTracker};
 use crate::storage::redis::RedisStore;
 
 /// Thread-safe in-memory cache for market data with optional Redis fallback
+/// and high-performance ring buffer for rolling window volatility tracking.
 #[derive(Debug, Clone, Default)]
 pub struct MarketState {
     data: Arc<RwLock<HashMap<String, MarketData>>>,
     redis: Option<RedisStore>,
+    rolling: RollingWindowTracker,
 }
 
 impl MarketState {
@@ -19,6 +22,7 @@ impl MarketState {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
             redis: None,
+            rolling: RollingWindowTracker::default(),
         }
     }
 
@@ -27,13 +31,35 @@ impl MarketState {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
             redis: Some(redis),
+            rolling: RollingWindowTracker::default(),
         }
     }
 
-    /// Updates or inserts market data for a symbol.
+    /// Access the rolling window tracker directly
+    pub fn rolling_tracker(&self) -> &RollingWindowTracker {
+        &self.rolling
+    }
+
+    /// Retrieves rolling volatility/move statistics for a symbol
+    pub async fn get_window_stats(
+        &self,
+        symbol: &str,
+        window_duration: chrono::Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<RollingMoveStats> {
+        self.rolling.get_window_stats(symbol, window_duration, now).await
+    }
+
+    /// Updates or inserts market data for a symbol and records a tick into the rolling ring buffer.
     /// Returns the previous price if the symbol was already tracked.
     pub async fn update(&self, data: MarketData) -> Option<Decimal> {
         let symbol = data.symbol.to_uppercase();
+
+        // Record tick into in-memory ring buffer
+        self.rolling
+            .record_tick(&symbol, data.update_at, data.price)
+            .await;
+
         let mut map = self.data.write().await;
         let prev_price = map.get(&symbol).map(|prev| prev.price);
         map.insert(symbol, data);
