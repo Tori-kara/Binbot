@@ -27,6 +27,8 @@ pub async fn run_bot(
     guild_id: Option<u64>,
 ) -> Result<(), Error> {
     let bot_alert_store = alert_store.clone();
+    let scheduler_market_state = market_state.clone();
+    let scheduler_repo = alert_store.repo().clone();
 
     let options = poise::FrameworkOptions {
         commands: vec![
@@ -34,6 +36,7 @@ pub async fn run_bot(
             crate::discord::commands::currencies(),
             crate::discord::commands::watch(),
             crate::discord::commands::alerts(),
+            crate::discord::commands::market(),
         ],
         on_error: |error| {
             Box::pin(async move {
@@ -103,9 +106,19 @@ pub async fn run_bot(
 
     // Spawn rate-limited Discord alert dispatcher
     let http = client.http.clone();
-    let dispatcher = crate::discord::notifier::AlertDispatcher::new(http);
+    let dispatcher = crate::discord::notifier::AlertDispatcher::new(http.clone());
     tokio::spawn(async move {
         dispatcher.run(notification_rx).await;
+    });
+
+    // Spawn scheduled 08:00 UTC daily market digest service
+    let digest_scheduler = crate::market::MarketDigestScheduler::new(
+        scheduler_market_state,
+        scheduler_repo,
+        http,
+    );
+    tokio::spawn(async move {
+        digest_scheduler.run().await;
     });
 
     tracing::info!("✓ Discord Gateway client connecting...");

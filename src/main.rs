@@ -171,7 +171,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let (alert_notif_tx, alert_notif_rx) = tokio::sync::mpsc::channel(1000);
-    let alert_engine = alerts::AlertEngine::new(alert_store.clone(), alert_notif_tx);
+    let alert_engine = alerts::AlertEngine::new(alert_store.clone(), alert_notif_tx)
+        .with_market_state(market_state.clone());
 
     tokio::spawn(async move {
         alert_engine.run(alert_market_rx).await;

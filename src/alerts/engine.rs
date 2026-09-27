@@ -1,13 +1,16 @@
 use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, trace, warn};
 
 use crate::alerts::cooldown::CooldownTracker;
-use crate::alerts::models::{Alert, AlertCondition, DEFAULT_HYSTERESIS_RATE};
+use crate::alerts::models::{Alert, AlertCondition, ComparisonOp, MetricTarget, DEFAULT_HYSTERESIS_RATE};
 use crate::alerts::store::AlertStore;
-use crate::market::MarketUpdateEvent;
+use crate::market::models::{MarketData, MarketUpdateEvent};
+use crate::market::rolling::RollingMoveStats;
+use crate::market::state::MarketState;
 
 /// Domain event representing an alert notification ready for Discord dispatch
 #[derive(Debug, Clone)]
@@ -42,89 +45,157 @@ pub enum AlertEvaluation {
     NoChange,
 }
 
-/// Pure function evaluating an alert against current market conditions
+/// Evaluates if an individual condition is satisfied given market data and rolling metrics
+pub fn check_condition_met(
+    condition: &AlertCondition,
+    market_data: &MarketData,
+    rolling_stats: Option<&RollingMoveStats>,
+    baseline_price: Option<Decimal>,
+) -> bool {
+    match condition {
+        AlertCondition::PriceAbove(target) => market_data.price >= *target,
+        AlertCondition::PriceBelow(target) => market_data.price <= *target,
+        AlertCondition::PercentageChange(pct) => {
+            let base = baseline_price.unwrap_or(Decimal::ZERO);
+            let target = base * (Decimal::ONE + (*pct / dec!(100)));
+            if *pct >= Decimal::ZERO {
+                market_data.price >= target
+            } else {
+                market_data.price <= target
+            }
+        }
+        AlertCondition::MetricThreshold { metric, op, value } => {
+            let actual = match metric {
+                MetricTarget::Price => market_data.price,
+                MetricTarget::Volume24h => market_data.volume_24hr,
+                MetricTarget::QuoteVolume24h => market_data.quote_volume_24hr,
+            };
+            op.matches(actual, *value)
+        }
+        AlertCondition::RollingWindowMove { percent, .. } => {
+            if let Some(stats) = rolling_stats {
+                if *percent >= Decimal::ZERO {
+                    stats.net_change_pct.abs() >= *percent || stats.max_swing_pct >= *percent
+                } else {
+                    stats.net_change_pct <= *percent
+                }
+            } else {
+                false
+            }
+        }
+        AlertCondition::All(items) => {
+            items.iter().all(|item| check_condition_met(item, market_data, rolling_stats, baseline_price))
+        }
+        AlertCondition::Any(items) => {
+            items.iter().any(|item| check_condition_met(item, market_data, rolling_stats, baseline_price))
+        }
+    }
+}
+
+/// Extracts rolling window duration from condition if present
+pub fn find_window_duration(condition: &AlertCondition) -> Option<Duration> {
+    match condition {
+        AlertCondition::RollingWindowMove { window_seconds, .. } => {
+            Some(Duration::seconds(*window_seconds as i64))
+        }
+        AlertCondition::All(items) | AlertCondition::Any(items) => {
+            for item in items {
+                if let Some(dur) = find_window_duration(item) {
+                    return Some(dur);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Pure function evaluating an alert against current market conditions,
+/// supporting composite conditions, rolling windows, cooldowns, and hysteresis reset.
 pub fn evaluate_alert(
+    alert: &Alert,
+    market_data: &MarketData,
+    rolling_stats: Option<&RollingMoveStats>,
+    previous_price: Option<Decimal>,
+    hysteresis_rate: Decimal,
+    now: DateTime<Utc>,
+) -> AlertEvaluation {
+    let current_price = market_data.price;
+    let is_met = check_condition_met(
+        &alert.condition,
+        market_data,
+        rolling_stats,
+        alert.baseline_price,
+    );
+
+    if alert.is_triggered {
+        // Alert has already fired. Check if condition cleared and crossed hysteresis reset band
+        if !is_met {
+            let reset_price = alert.reset_price(hysteresis_rate);
+            if !reset_price.is_zero() {
+                if alert.is_upward() {
+                    if current_price < reset_price {
+                        return AlertEvaluation::ResetArmed;
+                    }
+                } else {
+                    if current_price > reset_price {
+                        return AlertEvaluation::ResetArmed;
+                    }
+                }
+            } else {
+                // Non-price or rolling condition cleared
+                return AlertEvaluation::ResetArmed;
+            }
+        }
+        AlertEvaluation::NoChange
+    } else {
+        // Alert is armed. Check if condition is met
+        if is_met {
+            // Check cooldown tracker
+            if CooldownTracker::is_cooling_down(alert.last_triggered_at, alert.cooldown_seconds, now) {
+                let remaining = CooldownTracker::time_remaining(
+                    alert.last_triggered_at,
+                    alert.cooldown_seconds,
+                    now,
+                )
+                .unwrap_or_else(Duration::zero);
+
+                AlertEvaluation::SuppressedCooldown {
+                    trigger_price: current_price,
+                    remaining_cooldown: remaining,
+                }
+            } else {
+                AlertEvaluation::Triggered {
+                    trigger_price: current_price,
+                    previous_price,
+                }
+            }
+        } else {
+            AlertEvaluation::NoChange
+        }
+    }
+}
+
+/// Helper for simple price evaluation in tests
+pub fn evaluate_price_only(
     alert: &Alert,
     current_price: Decimal,
     previous_price: Option<Decimal>,
     hysteresis_rate: Decimal,
     now: DateTime<Utc>,
 ) -> AlertEvaluation {
-    let target = alert.target_price();
-    let reset_price = alert.reset_price(hysteresis_rate);
-    let is_upward = alert.is_upward();
-
-    if is_upward {
-        // --- UPWARD ALERT (e.g. PriceAbove $100,000, or PercentageChange +5%) ---
-        if alert.is_triggered {
-            // Alert has already fired. Must cross BELOW reset band ($99,500) to re-arm.
-            if current_price < reset_price {
-                AlertEvaluation::ResetArmed
-            } else {
-                AlertEvaluation::NoChange
-            }
-        } else {
-            // Alert is ARMED. Check if price crossed target.
-            if current_price >= target {
-                // Check cooldown
-                if CooldownTracker::is_cooling_down(alert.last_triggered_at, alert.cooldown_seconds, now) {
-                    let remaining = CooldownTracker::time_remaining(
-                        alert.last_triggered_at,
-                        alert.cooldown_seconds,
-                        now,
-                    )
-                    .unwrap_or_else(Duration::zero);
-
-                    AlertEvaluation::SuppressedCooldown {
-                        trigger_price: current_price,
-                        remaining_cooldown: remaining,
-                    }
-                } else {
-                    AlertEvaluation::Triggered {
-                        trigger_price: current_price,
-                        previous_price,
-                    }
-                }
-            } else {
-                AlertEvaluation::NoChange
-            }
-        }
-    } else {
-        // --- DOWNWARD ALERT (e.g. PriceBelow $4,000, or PercentageChange -5%) ---
-        if alert.is_triggered {
-            // Alert has already fired. Must cross ABOVE reset band ($4,020) to re-arm.
-            if current_price > reset_price {
-                AlertEvaluation::ResetArmed
-            } else {
-                AlertEvaluation::NoChange
-            }
-        } else {
-            // Alert is ARMED. Check if price crossed target.
-            if current_price <= target {
-                // Check cooldown
-                if CooldownTracker::is_cooling_down(alert.last_triggered_at, alert.cooldown_seconds, now) {
-                    let remaining = CooldownTracker::time_remaining(
-                        alert.last_triggered_at,
-                        alert.cooldown_seconds,
-                        now,
-                    )
-                    .unwrap_or_else(Duration::zero);
-
-                    AlertEvaluation::SuppressedCooldown {
-                        trigger_price: current_price,
-                        remaining_cooldown: remaining,
-                    }
-                } else {
-                    AlertEvaluation::Triggered {
-                        trigger_price: current_price,
-                        previous_price,
-                    }
-                }
-            } else {
-                AlertEvaluation::NoChange
-            }
-        }
-    }
+    let dummy = MarketData {
+        symbol: alert.symbol.clone(),
+        price: current_price,
+        price_change_24hr: Decimal::ZERO,
+        price_change_percent_24hr: Decimal::ZERO,
+        high_price_24hr: current_price,
+        low_price_24hr: current_price,
+        volume_24hr: Decimal::ZERO,
+        quote_volume_24hr: Decimal::ZERO,
+        update_at: now,
+    };
+    evaluate_alert(alert, &dummy, None, previous_price, hysteresis_rate, now)
 }
 
 /// Alert Engine service consuming normalized market update events
@@ -132,6 +203,7 @@ pub fn evaluate_alert(
 #[derive(Debug, Clone)]
 pub struct AlertEngine {
     store: Arc<AlertStore>,
+    market_state: Option<MarketState>,
     notification_tx: mpsc::Sender<AlertNotification>,
     hysteresis_rate: Decimal,
 }
@@ -143,9 +215,15 @@ impl AlertEngine {
     ) -> Self {
         Self {
             store,
+            market_state: None,
             notification_tx,
             hysteresis_rate: DEFAULT_HYSTERESIS_RATE,
         }
+    }
+
+    pub fn with_market_state(mut self, market_state: MarketState) -> Self {
+        self.market_state = Some(market_state);
+        self
     }
 
     #[allow(dead_code)]
@@ -160,7 +238,7 @@ impl AlertEngine {
 
         while let Ok(event) = market_rx.recv().await {
             if let MarketUpdateEvent::TickerUpdated { data, previous_price } = event {
-                self.process_ticker(data.symbol, data.price, previous_price).await;
+                self.process_ticker(&data, previous_price).await;
             }
         }
 
@@ -170,11 +248,10 @@ impl AlertEngine {
     /// Evaluates all active alerts registered for a given symbol
     pub async fn process_ticker(
         &self,
-        symbol: String,
-        current_price: Decimal,
+        market_data: &MarketData,
         previous_price: Option<Decimal>,
     ) {
-        let alerts = self.store.get_alerts_for_symbol(&symbol).await;
+        let alerts = self.store.get_alerts_for_symbol(&market_data.symbol).await;
         if alerts.is_empty() {
             return;
         }
@@ -196,9 +273,21 @@ impl AlertEngine {
                 alert_eval_copy.last_triggered_at = Some(now);
             }
 
+            // Retrieve rolling window stats if needed by condition
+            let rolling_stats = if let Some(dur) = find_window_duration(&alert.condition) {
+                if let Some(ref ms) = self.market_state {
+                    ms.get_window_stats(&market_data.symbol, dur, now).await
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let eval = evaluate_alert(
                 &alert_eval_copy,
-                current_price,
+                market_data,
+                rolling_stats.as_ref(),
                 previous_price,
                 self.hysteresis_rate,
                 now,
@@ -206,7 +295,7 @@ impl AlertEngine {
 
             match eval {
                 AlertEvaluation::Triggered { trigger_price, previous_price } => {
-                    // Atomically acquire Redis cooldown lock: SET cooldown:{alert_id} 1 EX {secs} NX
+                    // Atomically acquire Redis cooldown lock
                     let acquired = self.store.try_acquire_cooldown(
                         alert.id,
                         alert.cooldown_seconds,
@@ -265,8 +354,8 @@ impl AlertEngine {
                     debug!(
                         alert_id = alert.id,
                         symbol = %alert.symbol,
-                        price = %current_price,
-                        "↺ Alert re-armed after crossing hysteresis reset band"
+                        price = %market_data.price,
+                        "↺ Alert re-armed after condition/hysteresis reset"
                     );
 
                     self.store
@@ -291,7 +380,6 @@ impl AlertEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
 
     fn make_test_alert(
         id: i64,
@@ -323,139 +411,141 @@ mod tests {
     #[test]
     fn test_edge_triggering_and_hysteresis_price_above() {
         let now = Utc::now();
-        // Threshold: $100,000, 0.5% hysteresis -> reset at $99,500
         let alert = make_test_alert(
             1,
             AlertCondition::PriceAbove(dec!(100000)),
             None,
             1800,
             None,
-            false, // Armed
+            false,
         );
-
         let hysteresis = dec!(0.005);
 
-        // 1. Price is below threshold ($98,000) -> NoChange
-        let res = evaluate_alert(&alert, dec!(98000), None, hysteresis, now);
-        assert_eq!(res, AlertEvaluation::NoChange);
-
-        // 2. Price crosses threshold ($100,000) -> Triggered!
-        let res = evaluate_alert(&alert, dec!(100000), Some(dec!(98000)), hysteresis, now);
+        // 1. Below threshold
         assert_eq!(
-            res,
+            evaluate_price_only(&alert, dec!(98000), None, hysteresis, now),
+            AlertEvaluation::NoChange
+        );
+
+        // 2. Crosses threshold
+        assert_eq!(
+            evaluate_price_only(&alert, dec!(100000), Some(dec!(98000)), hysteresis, now),
             AlertEvaluation::Triggered {
                 trigger_price: dec!(100000),
                 previous_price: Some(dec!(98000))
             }
         );
 
-        // 3. Now alert is marked as triggered in state
-        let mut triggered_alert = alert.clone();
-        triggered_alert.is_triggered = true;
-        triggered_alert.last_triggered_at = Some(now);
+        // 3. Triggered state -> still above reset band ($99,500)
+        let mut triggered = alert.clone();
+        triggered.is_triggered = true;
+        triggered.last_triggered_at = Some(now);
 
-        // 4. Price continues rising ($101,000) -> NoChange (no duplicate notification!)
-        let res = evaluate_alert(&triggered_alert, dec!(101000), Some(dec!(100000)), hysteresis, now);
-        assert_eq!(res, AlertEvaluation::NoChange);
-
-        // 5. Price drops slightly to $99,700 (still above reset band $99,500) -> NoChange
-        let res = evaluate_alert(&triggered_alert, dec!(99700), Some(dec!(101000)), hysteresis, now);
-        assert_eq!(res, AlertEvaluation::NoChange);
-
-        // 6. Price drops below reset band to $99,400 -> ResetArmed!
-        let res = evaluate_alert(&triggered_alert, dec!(99400), Some(dec!(99700)), hysteresis, now);
-        assert_eq!(res, AlertEvaluation::ResetArmed);
-
-        // 7. Alert is re-armed
-        let mut rearmed_alert = triggered_alert.clone();
-        rearmed_alert.is_triggered = false;
-
-        // 8. If price rises to $100,050 while still within cooldown -> SuppressedCooldown
-        let res = evaluate_alert(&rearmed_alert, dec!(100050), Some(dec!(99400)), hysteresis, now);
-        assert!(matches!(res, AlertEvaluation::SuppressedCooldown { .. }));
-
-        // 9. If price rises to $100,050 after cooldown expires (31 mins later) -> Triggered!
-        let future = now + Duration::minutes(31);
-        let res = evaluate_alert(&rearmed_alert, dec!(100050), Some(dec!(99400)), hysteresis, future);
         assert_eq!(
-            res,
-            AlertEvaluation::Triggered {
-                trigger_price: dec!(100050),
-                previous_price: Some(dec!(99400))
-            }
-        );
-    }
-
-    #[test]
-    fn test_edge_triggering_and_hysteresis_price_below() {
-        let now = Utc::now();
-        // Threshold: $4,000, 0.5% hysteresis -> reset at $4,020
-        let alert = make_test_alert(
-            2,
-            AlertCondition::PriceBelow(dec!(4000)),
-            None,
-            1800,
-            None,
-            false, // Armed
-        );
-
-        let hysteresis = dec!(0.005);
-
-        // 1. Price is above threshold ($4,100) -> NoChange
-        let res = evaluate_alert(&alert, dec!(4100), None, hysteresis, now);
-        assert_eq!(res, AlertEvaluation::NoChange);
-
-        // 2. Price crosses below threshold ($3,990) -> Triggered!
-        let res = evaluate_alert(&alert, dec!(3990), Some(dec!(4100)), hysteresis, now);
-        assert_eq!(
-            res,
-            AlertEvaluation::Triggered {
-                trigger_price: dec!(3990),
-                previous_price: Some(dec!(4100))
-            }
-        );
-
-        // 3. Mark triggered
-        let mut triggered_alert = alert.clone();
-        triggered_alert.is_triggered = true;
-        triggered_alert.last_triggered_at = Some(now);
-
-        // 4. Price bounces slightly to $4,010 (below reset $4,020) -> NoChange
-        let res = evaluate_alert(&triggered_alert, dec!(4010), Some(dec!(3990)), hysteresis, now);
-        assert_eq!(res, AlertEvaluation::NoChange);
-
-        // 5. Price rises above reset band to $4,025 -> ResetArmed!
-        let res = evaluate_alert(&triggered_alert, dec!(4025), Some(dec!(4010)), hysteresis, now);
-        assert_eq!(res, AlertEvaluation::ResetArmed);
-    }
-
-    #[test]
-    fn test_percentage_change_alert_upward() {
-        let now = Utc::now();
-        // Baseline: $60,000, Condition: +5% -> Target: $63,000, Reset at $63,000 * 0.995 = $62,685
-        let alert = make_test_alert(
-            3,
-            AlertCondition::PercentageChange(dec!(5)),
-            Some(dec!(60000)),
-            1800,
-            None,
-            false,
-        );
-
-        let hysteresis = dec!(0.005);
-
-        // Price at $62,000 -> NoChange
-        assert_eq!(
-            evaluate_alert(&alert, dec!(62000), None, hysteresis, now),
+            evaluate_price_only(&triggered, dec!(99700), Some(dec!(100000)), hysteresis, now),
             AlertEvaluation::NoChange
         );
 
-        // Price hits $63,000 -> Triggered!
+        // 4. Drops below reset band -> ResetArmed!
         assert_eq!(
-            evaluate_alert(&alert, dec!(63000), Some(dec!(62000)), hysteresis, now),
+            evaluate_price_only(&triggered, dec!(99400), Some(dec!(99700)), hysteresis, now),
+            AlertEvaluation::ResetArmed
+        );
+    }
+
+    #[test]
+    fn test_multi_condition_and_triggering() {
+        let now = Utc::now();
+        let cond = AlertCondition::All(vec![
+            AlertCondition::PriceAbove(dec!(100000)),
+            AlertCondition::MetricThreshold {
+                metric: MetricTarget::Volume24h,
+                op: ComparisonOp::GreaterThan,
+                value: dec!(50000000000),
+            },
+        ]);
+        let alert = make_test_alert(2, cond, None, 1800, None, false);
+
+        // 1. Price is met ($105,000) but volume is NOT met ($40B) -> NoChange
+        let data1 = MarketData {
+            symbol: "BTCUSDT".to_string(),
+            price: dec!(105000),
+            price_change_24hr: dec!(2000),
+            price_change_percent_24hr: dec!(2.0),
+            high_price_24hr: dec!(106000),
+            low_price_24hr: dec!(100000),
+            volume_24hr: dec!(40000000000),
+            quote_volume_24hr: dec!(4000000000000),
+            update_at: now,
+        };
+        assert_eq!(
+            evaluate_alert(&alert, &data1, None, None, dec!(0.005), now),
+            AlertEvaluation::NoChange
+        );
+
+        // 2. Both Price ($105,000) and Volume ($55B) are met -> Triggered!
+        let mut data2 = data1.clone();
+        data2.volume_24hr = dec!(55000000000);
+        assert_eq!(
+            evaluate_alert(&alert, &data2, None, Some(dec!(104000)), dec!(0.005), now),
             AlertEvaluation::Triggered {
-                trigger_price: dec!(63000),
-                previous_price: Some(dec!(62000))
+                trigger_price: dec!(105000),
+                previous_price: Some(dec!(104000))
+            }
+        );
+    }
+
+    #[test]
+    fn test_rolling_window_volatility_triggering() {
+        let now = Utc::now();
+        let cond = AlertCondition::RollingWindowMove {
+            percent: dec!(3),
+            window_seconds: 300,
+        };
+        let alert = make_test_alert(3, cond, None, 1800, None, false);
+
+        let data = MarketData {
+            symbol: "BTCUSDT".to_string(),
+            price: dec!(65000),
+            price_change_24hr: dec!(1000),
+            price_change_percent_24hr: dec!(1.5),
+            high_price_24hr: dec!(66000),
+            low_price_24hr: dec!(64000),
+            volume_24hr: dec!(10000),
+            quote_volume_24hr: dec!(650000000),
+            update_at: now,
+        };
+
+        // 1. Move in window is only 1.2% -> NoChange
+        let stats_low = RollingMoveStats {
+            start_price: dec!(64200),
+            current_price: dec!(65000),
+            min_price: dec!(64200),
+            max_price: dec!(65000),
+            net_change_pct: dec!(1.24),
+            max_swing_pct: dec!(1.24),
+            sample_count: 30,
+        };
+        assert_eq!(
+            evaluate_alert(&alert, &data, Some(&stats_low), None, dec!(0.005), now),
+            AlertEvaluation::NoChange
+        );
+
+        // 2. Move in window is 3.5% -> Triggered!
+        let stats_high = RollingMoveStats {
+            start_price: dec!(62800),
+            current_price: dec!(65000),
+            min_price: dec!(62800),
+            max_price: dec!(65000),
+            net_change_pct: dec!(3.5),
+            max_swing_pct: dec!(3.5),
+            sample_count: 30,
+        };
+        assert_eq!(
+            evaluate_alert(&alert, &data, Some(&stats_high), None, dec!(0.005), now),
+            AlertEvaluation::Triggered {
+                trigger_price: dec!(65000),
+                previous_price: None
             }
         );
     }

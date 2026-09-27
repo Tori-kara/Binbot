@@ -65,6 +65,7 @@ pub struct AlertRecord {
     pub condition_type: String,
     pub threshold: Decimal,
     pub baseline_price: Option<Decimal>,
+    pub condition_payload: Option<serde_json::Value>,
     pub cooldown_seconds: i32,
     pub last_triggered_at: Option<NaiveDateTime>,
     pub is_triggered: bool,
@@ -84,9 +85,35 @@ pub struct AlertWithDetails {
     pub condition_type: String,
     pub threshold: Decimal,
     pub baseline_price: Option<Decimal>,
+    pub condition_payload: Option<serde_json::Value>,
     pub cooldown_seconds: i32,
     pub last_triggered_at: Option<NaiveDateTime>,
     pub is_triggered: bool,
+    pub enabled: bool,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DigestSubscriptionRecord {
+    pub id: i64,
+    pub guild_id: Option<i64>,
+    pub channel_id: i64,
+    pub scheduled_time_utc: String,
+    pub enabled: bool,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DigestSubscriptionWithDetails {
+    pub id: i64,
+    pub guild_id: Option<i64>,
+    pub guild_discord_id: Option<String>,
+    pub channel_id: i64,
+    pub channel_discord_id: String,
+    pub scheduled_time_utc: String,
     pub enabled: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
@@ -186,6 +213,7 @@ impl<'a> AlertRepository<'a> {
         condition_type: &str,
         threshold: Decimal,
         baseline_price: Option<Decimal>,
+        condition_payload: Option<serde_json::Value>,
         cooldown_seconds: i32,
     ) -> Result<AlertRecord, Error> {
         let row = sqlx::query_as::<_, AlertRecord>(
@@ -197,11 +225,12 @@ impl<'a> AlertRepository<'a> {
                 condition_type,
                 threshold,
                 baseline_price,
+                condition_payload,
                 cooldown_seconds,
                 is_triggered,
                 enabled
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, TRUE)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, TRUE)
             RETURNING
                 id,
                 user_id,
@@ -210,6 +239,7 @@ impl<'a> AlertRepository<'a> {
                 condition_type,
                 threshold,
                 baseline_price,
+                condition_payload,
                 cooldown_seconds,
                 last_triggered_at,
                 is_triggered,
@@ -224,6 +254,7 @@ impl<'a> AlertRepository<'a> {
         .bind(condition_type)
         .bind(threshold)
         .bind(baseline_price)
+        .bind(condition_payload)
         .bind(cooldown_seconds)
         .fetch_one(self.0)
         .await?;
@@ -245,6 +276,7 @@ impl<'a> AlertRepository<'a> {
                 a.condition_type,
                 a.threshold,
                 a.baseline_price,
+                a.condition_payload,
                 a.cooldown_seconds,
                 a.last_triggered_at,
                 a.is_triggered,
@@ -277,6 +309,7 @@ impl<'a> AlertRepository<'a> {
                 a.condition_type,
                 a.threshold,
                 a.baseline_price,
+                a.condition_payload,
                 a.cooldown_seconds,
                 a.last_triggered_at,
                 a.is_triggered,
@@ -337,6 +370,109 @@ impl<'a> AlertRepository<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DigestSubscriptionRepository<'a>(pub &'a PgPool);
+
+impl<'a> DigestSubscriptionRepository<'a> {
+    /// Subscribes or updates a channel for scheduled daily market digests.
+    pub async fn subscribe(
+        &self,
+        guild_id: Option<i64>,
+        channel_id: i64,
+        scheduled_time_utc: &str,
+    ) -> Result<DigestSubscriptionRecord, Error> {
+        let row = sqlx::query_as::<_, DigestSubscriptionRecord>(
+            r#"
+            INSERT INTO market_digest_subscriptions (
+                guild_id,
+                channel_id,
+                scheduled_time_utc,
+                enabled
+            )
+            VALUES ($1, $2, $3, TRUE)
+            ON CONFLICT (channel_id) DO UPDATE SET
+                guild_id = EXCLUDED.guild_id,
+                scheduled_time_utc = EXCLUDED.scheduled_time_utc,
+                enabled = TRUE,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING
+                id,
+                guild_id,
+                channel_id,
+                scheduled_time_utc,
+                enabled,
+                created_at,
+                updated_at
+            "#,
+        )
+        .bind(guild_id)
+        .bind(channel_id)
+        .bind(scheduled_time_utc)
+        .fetch_one(self.0)
+        .await?;
+
+        Ok(row)
+    }
+
+    /// Unsubscribes a channel from scheduled daily market digests.
+    pub async fn unsubscribe(&self, channel_discord_id: &str) -> Result<bool, Error> {
+        let res = sqlx::query(
+            r#"
+            UPDATE market_digest_subscriptions
+            SET enabled = FALSE, updated_at = CURRENT_TIMESTAMP
+            WHERE channel_id = (SELECT id FROM channels WHERE channel_id = $1)
+            "#,
+        )
+        .bind(channel_discord_id)
+        .execute(self.0)
+        .await?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Checks if a channel has an active daily market digest subscription.
+    pub async fn is_subscribed(&self, channel_discord_id: &str) -> Result<bool, Error> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            r#"
+            SELECT s.enabled
+            FROM market_digest_subscriptions s
+            JOIN channels c ON s.channel_id = c.id
+            WHERE c.channel_id = $1 AND s.enabled = TRUE
+            "#,
+        )
+        .bind(channel_discord_id)
+        .fetch_optional(self.0)
+        .await?;
+
+        Ok(row.map(|r| r.0).unwrap_or(false))
+    }
+
+    /// Fetches all active daily digest subscriptions with channel and guild discord IDs.
+    pub async fn get_active_subscriptions(&self) -> Result<Vec<DigestSubscriptionWithDetails>, Error> {
+        sqlx::query_as::<_, DigestSubscriptionWithDetails>(
+            r#"
+            SELECT 
+                s.id,
+                s.guild_id,
+                g.guild_id as guild_discord_id,
+                s.channel_id,
+                c.channel_id as channel_discord_id,
+                s.scheduled_time_utc,
+                s.enabled,
+                s.created_at,
+                s.updated_at
+            FROM market_digest_subscriptions s
+            LEFT JOIN guilds g ON s.guild_id = g.id
+            JOIN channels c ON s.channel_id = c.id
+            WHERE s.enabled = TRUE
+            ORDER BY s.id ASC
+            "#,
+        )
+        .fetch_all(self.0)
+        .await
+    }
+}
+
 /// Unified Database Repository holding a pool reference and providing
 /// direct access to individual sub-repositories.
 #[derive(Debug, Clone)]
@@ -368,6 +504,10 @@ impl DbRepository {
 
     pub fn alerts(&self) -> AlertRepository<'_> {
         AlertRepository(&self.pool)
+    }
+
+    pub fn digests(&self) -> DigestSubscriptionRepository<'_> {
+        DigestSubscriptionRepository(&self.pool)
     }
 }
 
@@ -439,6 +579,7 @@ mod tests {
                 "SOLUSDT",
                 "price_above",
                 dec!(300.00),
+                None,
                 None,
                 1800,
             )
