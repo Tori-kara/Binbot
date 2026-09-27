@@ -10,6 +10,8 @@ pub struct Config {
     pub discord_bot_url: Option<String>,
     pub discord_guild_id: Option<u64>,
     pub port: u16,
+    pub redis_market_cache_enabled: bool,
+    pub redis_market_cache_interval_secs: u64,
 }
 
 impl Config {
@@ -39,6 +41,16 @@ impl Config {
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(10000);
 
+        let redis_market_cache_enabled = env::var("REDIS_CACHE_MARKET_DATA")
+            .or_else(|_| env::var("REDIS_MARKET_CACHE_ENABLED"))
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+
+        let redis_market_cache_interval_secs = env::var("REDIS_MARKET_CACHE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+
         Ok(Self {
             database_url,
             redis_url,
@@ -48,6 +60,8 @@ impl Config {
             discord_bot_url,
             discord_guild_id,
             port,
+            redis_market_cache_enabled,
+            redis_market_cache_interval_secs,
         })
     }
 

@@ -285,7 +285,7 @@ impl AlertStore {
     /// Attempts to acquire an atomic distributed cooldown lock in Redis:
     /// `SET cooldown:{alert_id} 1 EX {cooldown_seconds} NX`.
     /// Returns `true` if lock acquired, `false` if currently in cooldown.
-    /// Falls back to local in-memory tracker if Redis is not configured or errors out.
+    /// Prioritizes fast-path in-memory check to avoid wasteful Redis calls.
     pub async fn try_acquire_cooldown(
         &self,
         alert_id: i64,
@@ -293,6 +293,11 @@ impl AlertStore {
         last_triggered_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> bool {
+        // Fast-path: If local memory already knows we are cooling down, reject immediately without Redis
+        if CooldownTracker::is_cooling_down(last_triggered_at, cooldown_seconds, now) {
+            return false;
+        }
+
         if let Some(redis) = &self.redis {
             match redis.try_set_cooldown(alert_id, cooldown_seconds).await {
                 Ok(acquired) => return acquired,
@@ -305,7 +310,8 @@ impl AlertStore {
         !CooldownTracker::is_cooling_down(last_triggered_at, cooldown_seconds, now)
     }
 
-    /// Checks if an alert is cooling down, verifying Redis first with in-memory fallback.
+    /// Checks if an alert is cooling down, checking in-memory state first before querying Redis.
+    #[allow(dead_code)]
     pub async fn is_cooling_down(
         &self,
         alert_id: i64,
@@ -313,6 +319,11 @@ impl AlertStore {
         cooldown_seconds: u32,
         now: DateTime<Utc>,
     ) -> bool {
+        // Fast-path: Check in-memory state first
+        if CooldownTracker::is_cooling_down(last_triggered_at, cooldown_seconds, now) {
+            return true;
+        }
+
         if let Some(redis) = &self.redis {
             match redis.is_cooling_down(alert_id).await {
                 Ok(cooling) => return cooling,
@@ -322,10 +333,11 @@ impl AlertStore {
             }
         }
 
-        CooldownTracker::is_cooling_down(last_triggered_at, cooldown_seconds, now)
+        false
     }
 
-    /// Computes remaining cooldown duration, querying Redis TTL first with in-memory fallback.
+    /// Computes remaining cooldown duration, querying in-memory state first with Redis TTL fallback.
+    #[allow(dead_code)]
     pub async fn get_cooldown_remaining(
         &self,
         alert_id: i64,
@@ -333,13 +345,18 @@ impl AlertStore {
         cooldown_seconds: u32,
         now: DateTime<Utc>,
     ) -> Option<Duration> {
+        // Fast-path: Check in-memory remaining time first
+        if let Some(rem) = CooldownTracker::time_remaining(last_triggered_at, cooldown_seconds, now) {
+            return Some(rem);
+        }
+
         if let Some(redis) = &self.redis {
             if let Ok(Some(rem)) = redis.get_cooldown_remaining(alert_id).await {
                 return Some(rem);
             }
         }
 
-        CooldownTracker::time_remaining(last_triggered_at, cooldown_seconds, now)
+        None
     }
 }
 
