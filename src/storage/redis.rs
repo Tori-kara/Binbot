@@ -54,16 +54,52 @@ pub async fn init_redis(redis_url: &str) -> Result<MultiplexedConnection, redis:
     }))
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+const REDIS_OP_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Helper store wrapping a Redis multiplexed connection for volatile market state
-/// and distributed alert cooldown locks.
+/// and distributed alert cooldown locks with an automatic circuit breaker.
 #[derive(Debug, Clone)]
 pub struct RedisStore {
     conn: MultiplexedConnection,
+    circuit_broken: Arc<AtomicBool>,
 }
 
 impl RedisStore {
     pub fn new(conn: MultiplexedConnection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            circuit_broken: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Checks if Redis is currently available and not tripped by quota caps or network faults
+    pub fn is_available(&self) -> bool {
+        !self.circuit_broken.load(Ordering::Relaxed)
+    }
+
+    /// Trips the circuit breaker to bypass all Redis calls and switch to in-memory mode
+    pub fn trip_circuit(&self, reason: &str) {
+        if !self.circuit_broken.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                "⚠️ Redis circuit breaker tripped: {reason}. Switching to 100% in-memory mode to maintain bot responsiveness."
+            );
+        }
+    }
+
+    /// Inspects a Redis error; trips the circuit breaker immediately on quota caps
+    fn inspect_error(&self, err: &redis::RedisError) {
+        let msg = err.to_string().to_lowercase();
+        if msg.contains("max requests limit exceeded")
+            || msg.contains("max daily request limit")
+            || msg.contains("quota")
+            || msg.contains("limit exceeded")
+            || msg.contains("capped")
+        {
+            self.trip_circuit(&format!("Upstash quota limit reached ({err})"));
+        }
     }
 
     #[allow(dead_code)]
@@ -77,6 +113,10 @@ impl RedisStore {
         data: &MarketData,
         ttl_seconds: u64,
     ) -> Result<(), redis::RedisError> {
+        if !self.is_available() {
+            return Ok(());
+        }
+
         let mut conn = self.conn.clone();
         let key = format!("market:{}", data.symbol.to_uppercase());
         let json = serde_json::to_string(data).map_err(|e| {
@@ -87,23 +127,36 @@ impl RedisStore {
             redis::RedisError::from(io_err)
         })?;
 
-        if ttl_seconds > 0 {
-            let _: () = redis::cmd("SET")
-                .arg(&key)
-                .arg(json)
-                .arg("EX")
-                .arg(ttl_seconds)
-                .query_async(&mut conn)
-                .await?;
-        } else {
-            let _: () = redis::cmd("SET")
-                .arg(&key)
-                .arg(json)
-                .query_async(&mut conn)
-                .await?;
-        }
+        let fut = async {
+            if ttl_seconds > 0 {
+                let _: () = redis::cmd("SET")
+                    .arg(&key)
+                    .arg(json)
+                    .arg("EX")
+                    .arg(ttl_seconds)
+                    .query_async(&mut conn)
+                    .await?;
+            } else {
+                let _: () = redis::cmd("SET")
+                    .arg(&key)
+                    .arg(json)
+                    .query_async(&mut conn)
+                    .await?;
+            }
+            Ok::<(), redis::RedisError>(())
+        };
 
-        Ok(())
+        match tokio::time::timeout(REDIS_OP_TIMEOUT, fut).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.inspect_error(&e);
+                Ok(()) // Don't propagate cache write failures to caller
+            }
+            Err(_) => {
+                tracing::debug!("Redis set_market_snapshot timed out after 500ms");
+                Ok(())
+            }
+        }
     }
 
     /// Fetches the latest market snapshot for a symbol from Redis: `market:{SYMBOL}`
@@ -111,25 +164,44 @@ impl RedisStore {
         &self,
         symbol: &str,
     ) -> Result<Option<MarketData>, redis::RedisError> {
+        if !self.is_available() {
+            return Ok(None);
+        }
+
         let mut conn = self.conn.clone();
         let key = format!("market:{}", symbol.to_uppercase());
-        let json: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await?;
 
-        match json {
-            Some(s) => {
-                let data: MarketData = serde_json::from_str(&s).map_err(|e| {
-                    let io_err = std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("MarketData deserialization error: {e}"),
-                    );
-                    redis::RedisError::from(io_err)
-                })?;
-                Ok(Some(data))
+        let fut = async {
+            let json: Option<String> = redis::cmd("GET")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await?;
+
+            match json {
+                Some(s) => {
+                    let data: MarketData = serde_json::from_str(&s).map_err(|e| {
+                        let io_err = std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("MarketData deserialization error: {e}"),
+                        );
+                        redis::RedisError::from(io_err)
+                    })?;
+                    Ok(Some(data))
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
+        };
+
+        match tokio::time::timeout(REDIS_OP_TIMEOUT, fut).await {
+            Ok(Ok(opt)) => Ok(opt),
+            Ok(Err(e)) => {
+                self.inspect_error(&e);
+                Ok(None)
+            }
+            Err(_) => {
+                tracing::debug!("Redis get_market_snapshot timed out after 500ms; falling back to memory");
+                Ok(None)
+            }
         }
     }
 
@@ -140,30 +212,67 @@ impl RedisStore {
         alert_id: i64,
         cooldown_seconds: u32,
     ) -> Result<bool, redis::RedisError> {
+        if !self.is_available() {
+            return Err(redis::RedisError::from(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Redis circuit breaker tripped",
+            )));
+        }
+
         let mut conn = self.conn.clone();
         let key = format!("cooldown:{}", alert_id);
 
-        let res: Option<String> = redis::cmd("SET")
-            .arg(&key)
-            .arg("1")
-            .arg("EX")
-            .arg(cooldown_seconds)
-            .arg("NX")
-            .query_async(&mut conn)
-            .await?;
+        let fut = async {
+            let res: Option<String> = redis::cmd("SET")
+                .arg(&key)
+                .arg("1")
+                .arg("EX")
+                .arg(cooldown_seconds)
+                .arg("NX")
+                .query_async(&mut conn)
+                .await?;
 
-        Ok(res.as_deref() == Some("OK"))
+            Ok(res.as_deref() == Some("OK"))
+        };
+
+        match tokio::time::timeout(REDIS_OP_TIMEOUT, fut).await {
+            Ok(Ok(b)) => Ok(b),
+            Ok(Err(e)) => {
+                self.inspect_error(&e);
+                Err(e)
+            }
+            Err(_) => Err(redis::RedisError::from(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Redis try_set_cooldown timed out",
+            ))),
+        }
     }
 
     /// Checks whether an alert cooldown key exists in Redis: `EXISTS cooldown:{alert_id}`
     pub async fn is_cooling_down(&self, alert_id: i64) -> Result<bool, redis::RedisError> {
+        if !self.is_available() {
+            return Ok(false);
+        }
+
         let mut conn = self.conn.clone();
         let key = format!("cooldown:{}", alert_id);
-        let exists: bool = redis::cmd("EXISTS")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await?;
-        Ok(exists)
+
+        let fut = async {
+            let exists: bool = redis::cmd("EXISTS")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await?;
+            Ok(exists)
+        };
+
+        match tokio::time::timeout(REDIS_OP_TIMEOUT, fut).await {
+            Ok(Ok(b)) => Ok(b),
+            Ok(Err(e)) => {
+                self.inspect_error(&e);
+                Ok(false)
+            }
+            Err(_) => Ok(false),
+        }
     }
 
     /// Retrieves remaining cooldown time: `TTL cooldown:{alert_id}`
@@ -171,29 +280,61 @@ impl RedisStore {
         &self,
         alert_id: i64,
     ) -> Result<Option<chrono::Duration>, redis::RedisError> {
+        if !self.is_available() {
+            return Ok(None);
+        }
+
         let mut conn = self.conn.clone();
         let key = format!("cooldown:{}", alert_id);
-        let ttl: i64 = redis::cmd("TTL")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await?;
 
-        if ttl > 0 {
-            Ok(Some(chrono::Duration::seconds(ttl)))
-        } else {
-            Ok(None)
+        let fut = async {
+            let ttl: i64 = redis::cmd("TTL")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await?;
+
+            if ttl > 0 {
+                Ok(Some(chrono::Duration::seconds(ttl)))
+            } else {
+                Ok(None)
+            }
+        };
+
+        match tokio::time::timeout(REDIS_OP_TIMEOUT, fut).await {
+            Ok(Ok(d)) => Ok(d),
+            Ok(Err(e)) => {
+                self.inspect_error(&e);
+                Ok(None)
+            }
+            Err(_) => Ok(None),
         }
     }
 
     /// Clears the cooldown key: `DEL cooldown:{alert_id}`
     pub async fn clear_cooldown(&self, alert_id: i64) -> Result<(), redis::RedisError> {
+        if !self.is_available() {
+            return Ok(());
+        }
+
         let mut conn = self.conn.clone();
         let key = format!("cooldown:{}", alert_id);
-        let _: () = redis::cmd("DEL")
-            .arg(&key)
-            .query_async(&mut conn)
-            .await?;
-        Ok(())
+
+        let fut = async {
+            let _: () = redis::cmd("DEL")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await?;
+            Ok(())
+        };
+
+        match tokio::time::timeout(REDIS_OP_TIMEOUT, fut).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.inspect_error(&e);
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        }
     }
 }
 
@@ -239,11 +380,16 @@ mod tests {
         };
 
         if let Err(e) = store.set_market_snapshot(&test_data, 60).await {
-            if e.to_string().contains("max requests limit exceeded") {
+            if e.to_string().contains("max requests limit exceeded") || e.to_string().contains("quota") {
                 println!("Skipping live Redis test: Upstash quota reached ({e})");
                 return;
             }
             panic!("Set snapshot failed: {e}");
+        }
+
+        if !store.is_available() {
+            println!("Skipping live Redis test: Upstash quota reached (circuit breaker active)");
+            return;
         }
         let fetched = store
             .get_market_snapshot("TESTCOIN")

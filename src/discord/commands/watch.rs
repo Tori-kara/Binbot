@@ -15,27 +15,17 @@ pub async fn watch(
     #[description = "Cooldown period in minutes before re-triggering (default: 30)"]
     cooldown_minutes: Option<u32>,
 ) -> Result<(), Error> {
+    ctx.defer().await?;
+
     let clean_symbol = symbol.trim().to_uppercase();
 
-    // Check if symbol exists in in-memory market state
+    // Fast in-memory lookup (< 1ms, auto-resolves symbol and symbolUSDT)
     let snapshot = match ctx.data().market_state.get_snapshot(&clean_symbol).await {
-        Some(s) => Some(s),
-        None => {
-            if !clean_symbol.ends_with("USDT") {
-                let usdt_pair = format!("{}USDT", clean_symbol);
-                ctx.data().market_state.get_snapshot(&usdt_pair).await
-            } else {
-                None
-            }
-        }
-    };
-
-    let snapshot = match snapshot {
         Some(s) => s,
         None => {
             let tracked = ctx.data().market_state.get_symbols().await;
             let embed = embeds::create_not_found_embed(&clean_symbol, &tracked);
-            ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true)).await?;
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
             return Ok(());
         }
     };

@@ -14,6 +14,8 @@ pub async fn alerts(_ctx: Context<'_>) -> Result<(), Error> {
 /// List all of your active alerts
 #[poise::command(slash_command)]
 pub async fn list(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+
     let user_discord_id = ctx.author().id.to_string();
     let username = ctx.author().name.clone();
 
@@ -31,6 +33,8 @@ pub async fn delete(
     #[description = "The ID of the alert to delete (found via /alerts list)"]
     id: i64,
 ) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+
     let user_discord_id = ctx.author().id.to_string();
 
     match ctx.data().alert_store.delete_alert(id, &user_discord_id).await {
@@ -67,6 +71,8 @@ pub async fn delete(
 /// Delete all of your active alerts
 #[poise::command(slash_command)]
 pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+
     let user_discord_id = ctx.author().id.to_string();
     let alerts = ctx.data().alert_store.get_alerts_for_user(&user_discord_id).await;
 

@@ -16,6 +16,8 @@ pub async fn market(_ctx: Context<'_>) -> Result<(), Error> {
 /// View the live global cryptocurrency market summary and top movers
 #[poise::command(slash_command)]
 pub async fn overview(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+
     let snapshots = ctx.data().market_state.get_all_snapshots().await;
     if snapshots.is_empty() {
         ctx.send(
@@ -47,6 +49,8 @@ pub async fn digest(_ctx: Context<'_>) -> Result<(), Error> {
 /// Subscribe this channel to receive daily market intelligence digests at 08:00 UTC
 #[poise::command(slash_command)]
 pub async fn subscribe(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+
     let channel_discord_id = ctx.channel_id().to_string();
     let channel_name = ctx.channel_id().name(&ctx).await.unwrap_or_else(|_| "digest-channel".to_string());
     let guild_discord_id = ctx.guild_id().map(|g| g.to_string());
@@ -79,6 +83,8 @@ pub async fn subscribe(ctx: Context<'_>) -> Result<(), Error> {
 /// Unsubscribe this channel from scheduled daily market digests
 #[poise::command(slash_command)]
 pub async fn unsubscribe(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+
     let channel_discord_id = ctx.channel_id().to_string();
     let repo = ctx.data().alert_store.repo();
 
@@ -102,6 +108,8 @@ pub async fn unsubscribe(ctx: Context<'_>) -> Result<(), Error> {
 /// Check whether this channel is subscribed to the 08:00 UTC daily market digest
 #[poise::command(slash_command)]
 pub async fn status(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+
     let channel_discord_id = ctx.channel_id().to_string();
     let is_sub = ctx
         .data()
