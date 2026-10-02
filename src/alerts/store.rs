@@ -302,7 +302,7 @@ impl AlertStore {
             match redis.try_set_cooldown(alert_id, cooldown_seconds).await {
                 Ok(acquired) => return acquired,
                 Err(e) => {
-                    warn!("Redis cooldown check failed for alert #{alert_id}: {e}, falling back to memory");
+                    trace!("Redis cooldown check failed for alert #{alert_id}: {e}, falling back to memory");
                 }
             }
         }

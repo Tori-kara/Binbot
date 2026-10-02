@@ -4,6 +4,8 @@ use crate::discord::embeds;
 /// Display all supported local currencies and their active exchange rates
 #[poise::command(slash_command)]
 pub async fn currencies(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+
     let supported = ctx.data().currency_service.get_supported_rates().await;
     let last_updated = ctx.data().currency_service.last_updated().await;
     let last_checked = ctx.data().currency_service.last_checked().await;

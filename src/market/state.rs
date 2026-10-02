@@ -81,23 +81,41 @@ impl MarketState {
     }
 
     /// Retrieves a cloned snapshot of the market data for a symbol (case-insensitive).
-    /// If not present in-memory, attempts to query Redis `market:{SYMBOL}`.
+    /// Checks in-memory cache first (including {SYMBOL}USDT pair), then optional Redis.
     pub async fn get_snapshot(&self, symbol: &str) -> Option<MarketData> {
-        let key = symbol.to_uppercase();
+        let key = symbol.trim().to_uppercase();
         {
             let map = self.data.read().await;
             if let Some(d) = map.get(&key) {
                 return Some(d.clone());
             }
+
+            // Fast-path in-memory check: if user entered e.g. "BTC", resolve "BTCUSDT" immediately from RAM
+            if !key.ends_with("USDT") {
+                let usdt_key = format!("{}USDT", key);
+                if let Some(d) = map.get(&usdt_key) {
+                    return Some(d.clone());
+                }
+            }
         }
 
-        // Fallback to Redis if configured
+        // Fallback to Redis only if configured and circuit breaker is healthy
         if let Some(redis) = &self.redis {
-            if let Ok(Some(remote_data)) = redis.get_market_snapshot(&key).await {
-                // Populate in-memory cache
-                let mut map = self.data.write().await;
-                map.insert(key, remote_data.clone());
-                return Some(remote_data);
+            if redis.is_available() {
+                if let Ok(Some(remote_data)) = redis.get_market_snapshot(&key).await {
+                    let mut map = self.data.write().await;
+                    map.insert(key, remote_data.clone());
+                    return Some(remote_data);
+                }
+
+                if !key.ends_with("USDT") {
+                    let usdt_key = format!("{}USDT", key);
+                    if let Ok(Some(remote_data)) = redis.get_market_snapshot(&usdt_key).await {
+                        let mut map = self.data.write().await;
+                        map.insert(usdt_key, remote_data.clone());
+                        return Some(remote_data);
+                    }
+                }
             }
         }
 

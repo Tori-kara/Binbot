@@ -87,21 +87,12 @@ pub async fn price(
     #[autocomplete = "autocomplete_currency"]
     currency: Option<String>,
 ) -> Result<(), Error> {
+    ctx.defer().await?;
+
     let clean = symbol.trim().to_uppercase();
 
-    // In-memory read (< 1ms latency, avoiding Discord 3s timeout)
-    let snapshot = match ctx.data().market_state.get_snapshot(&clean).await {
-        Some(data) => Some(data),
-        None => {
-            // If user typed e.g. "BTC", also try "BTCUSDT"
-            if !clean.ends_with("USDT") {
-                let usdt_pair = format!("{}USDT", clean);
-                ctx.data().market_state.get_snapshot(&usdt_pair).await
-            } else {
-                None
-            }
-        }
-    };
+    // Fast in-memory lookup (< 1ms, auto-resolves symbol and symbolUSDT)
+    let snapshot = ctx.data().market_state.get_snapshot(&clean).await;
 
     // Resolve target currency if specified
     let target_curr = if let Some(ref curr_query) = currency {
@@ -119,7 +110,7 @@ pub async fn price(
         None => {
             let tracked = ctx.data().market_state.get_symbols().await;
             let embed = embeds::create_not_found_embed(&clean, &tracked);
-            ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true))
+            ctx.send(poise::CreateReply::default().embed(embed))
                 .await?;
         }
     }

@@ -41,6 +41,15 @@ pub async fn run_bot(
         on_error: |error| {
             Box::pin(async move {
                 tracing::error!("Discord bot error: {:?}", error);
+                if let poise::FrameworkError::Command { ctx, error, .. } = error {
+                    let _ = ctx
+                        .send(
+                            poise::CreateReply::default()
+                                .content(format!("An error occurred while running the command: {error}"))
+                                .ephemeral(true),
+                        )
+                        .await;
+                }
             })
         },
         pre_command: |ctx| {

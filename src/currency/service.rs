@@ -330,9 +330,20 @@ impl CurrencyService {
     /// Loads cached rates payload from Redis if present
     async fn load_from_redis(&self) -> Option<CachedRatesPayload> {
         let redis_mutex = self.redis.as_ref()?;
-        let mut conn = redis_mutex.lock().await;
+        let mut conn = match tokio::time::timeout(Duration::from_millis(500), redis_mutex.lock()).await {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
 
-        let raw: Option<String> = conn.get(REDIS_CURRENCY_CACHE_KEY).await.ok()?;
+        let raw: Option<String> = match tokio::time::timeout(
+            Duration::from_millis(500),
+            conn.get(REDIS_CURRENCY_CACHE_KEY),
+        )
+        .await
+        {
+            Ok(Ok(val)) => val,
+            _ => return None,
+        };
         let payload_str = raw?;
 
         serde_json::from_str::<CachedRatesPayload>(&payload_str).ok()
@@ -347,12 +358,25 @@ impl CurrencyService {
             };
 
             if let Ok(json_str) = serde_json::to_string(&payload) {
-                let mut conn = redis_mutex.lock().await;
-                let res: Result<(), redis::RedisError> = conn.set(REDIS_CURRENCY_CACHE_KEY, json_str).await;
-                if let Err(e) = res {
-                    tracing::warn!("Failed to persist currency cache to Redis: {}", e);
-                } else {
-                    tracing::info!("✓ Currency cache persisted to Redis under key '{}'", REDIS_CURRENCY_CACHE_KEY);
+                let mut conn = match tokio::time::timeout(Duration::from_millis(500), redis_mutex.lock()).await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let res = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    conn.set(REDIS_CURRENCY_CACHE_KEY, json_str),
+                )
+                .await;
+                match res {
+                    Ok(Ok(())) => {
+                        tracing::info!("✓ Currency cache persisted to Redis under key '{}'", REDIS_CURRENCY_CACHE_KEY);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!("Failed to persist currency cache to Redis: {}", e);
+                    }
+                    Err(_) => {
+                        tracing::debug!("Redis persist currency cache timed out after 500ms");
+                    }
                 }
             }
         }
